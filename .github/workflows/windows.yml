@@ -38,9 +38,32 @@ jobs:
       - name: Probe
         continue-on-error: true
         run: python -u -X faulthandler .github/windows-probe.py
-      - name: Try building pyvirtualcam from source
+      - name: Which OpenGL is used
+        continue-on-error: true
+        run: |
+          pacman -Ql mingw-w64-ucrt-x86_64-mesa | grep -iE "opengl32|\.dll$" | head -8
+          ls -la /c/Windows/System32/opengl32.dll
+          GST_DEBUG=glcontext:4,gldisplay:4 python -u .github/windows-probe.py shader 2>&1 | grep -iE "version|vendor|renderer|PASS|FAIL|error" | head -20
+          echo "exit code: ${PIPESTATUS[0]}"
+      - name: Shader with Mesa software OpenGL
+        continue-on-error: true
+        run: |
+          cp "$(pacman -Ql mingw-w64-ucrt-x86_64-mesa | awk '/opengl32\.dll$/ {print $2}' | head -1)" ./opengl32.dll || true
+          cp ./opengl32.dll "$(dirname "$(which python)")/" || true
+          GALLIUM_DRIVER=llvmpipe GST_DEBUG=glcontext:4 python -u .github/windows-probe.py shader 2>&1 | grep -iE "version|vendor|renderer|PASS|FAIL|error" | head -20
+          echo "exit code: ${PIPESTATUS[0]}"
+      - name: Build pyvirtualcam with the MinGW linker flag
         continue-on-error: true
         run: |
           git clone -q --recursive --depth 1 https://github.com/letmaik/pyvirtualcam
-          pip install --break-system-packages --no-build-isolation ./pyvirtualcam 2>&1 | tail -25
+          grep -rln "DEFAULTLIB" pyvirtualcam --include=*.py
+          grep -rl "DEFAULTLIB" pyvirtualcam --include=*.py | xargs sed -i 's#/DEFAULTLIB:advapi32.lib#-ladvapi32#'
+          pip install --break-system-packages --no-build-isolation ./pyvirtualcam 2>&1 | tail -4
           python -c "import pyvirtualcam; print('PASS pyvirtualcam', pyvirtualcam.__version__)"
+          python -c "
+          import pyvirtualcam
+          try:
+              pyvirtualcam.Camera(width=1280, height=720, fps=30, backend='obs')
+          except Exception as e:
+              print('expected without OBS installed:', e)
+          "
