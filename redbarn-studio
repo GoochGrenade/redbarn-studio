@@ -1,0 +1,1251 @@
+#!/usr/bin/python3
+# Copyright (C) 2026 Redbarn Christian Co.
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Redbarn Studio: webcam and mic -> cinematic filters -> virtual camera and mic for Discord.
+
+  redbarn-studio --install     add it to your app menu, then show what else is needed
+  redbarn-studio --check       show what's installed and what's missing
+  redbarn-studio --uninstall   remove it from your app menu
+  redbarn-studio --self-test   check the filters on a synthetic source (no webcam)
+"""
+import ctypes
+import ctypes.util
+import fcntl
+import glob
+import math
+import os
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+APP_ID = "co.redbarn.Studio"
+APP_NAME = "Redbarn Studio"
+COPYRIGHT = "© 2026 Redbarn Christian Co."
+MIC_NAME = "Redbarn Mic"
+MIC_NODE, OUTPUT_NODE = "redbarn_mic", "redbarn_output"
+RUBBERBAND_NAMES = ("librubberband.so.3", "librubberband.so.2")  # Fedora, then Ubuntu/Debian
+VIDIOC_QUERYCAP = 0x80685600
+LOOPBACK_SETUP = 'sudo modprobe v4l2loopback exclusive_caps=1 card_label="Redbarn Camera"'
+GST_ELEMENTS = ("v4l2src", "v4l2sink", "jpegdec", "glupload", "glshader", "gldownload", "textoverlay", "videoflip",
+                "pulsesrc", "pulsesink", "appsrc", "appsink", "audiocheblimit", "audioecho", "audioamplify", "freeverb")
+PACKAGES = {  # (Fedora, Ubuntu/Debian)
+    "ui": ("python3-gobject gtk4 libadwaita", "python3-gi gir1.2-gtk-4.0 gir1.2-adw-1"),
+    "gst": ("gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free",
+            "gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-gl"),
+    "loopback": ("v4l2loopback  (from RPM Fusion)", "v4l2loopback-dkms"),
+    "pipewire": ("pipewire-utils pipewire-pulseaudio", "pipewire-bin pipewire-pulse pulseaudio-utils"),
+    "rubberband": ("rubberband-libs", "librubberband2  (or librubberband3)"),
+}
+ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="#2a2523"/>
+  <path d="M64 22 L96 42 L104 66 L104 106 L24 106 L24 66 L32 42 Z" fill="#a32a22"/>
+  <path d="M64 22 L96 42 L104 66 L104 72 L98 72 L91 46 L64 29 L37 46 L30 72 L24 72 L24 66 L32 42 Z" fill="#f4efe6"/>
+  <rect x="55" y="48" width="18" height="14" rx="1.5" fill="#2a2523" stroke="#f4efe6" stroke-width="3"/>
+  <path d="M64 48 V62 M55 55 H73" stroke="#f4efe6" stroke-width="2"/>
+  <rect x="44" y="72" width="40" height="34" fill="#7f1f19" stroke="#f4efe6" stroke-width="3.5"/>
+  <path d="M44 72 L84 106 M84 72 L44 106 M64 72 V106" stroke="#f4efe6" stroke-width="3"/>
+</svg>
+"""
+
+
+def pactl(*args):
+    return subprocess.run(["pactl", *args], capture_output=True, text=True, timeout=5).stdout.strip()
+
+
+def find_mic():
+    # Never read our own virtual mic: that would be a feedback loop.
+    mic = pactl("get-default-source")
+    return mic if mic and mic not in (MIC_NODE, f"{OUTPUT_NODE}.monitor") else None
+
+
+def find_webcam():
+    # shortcut: takes the first webcam, add a picker if a second one is ever attached
+    cams = sorted(glob.glob("/dev/v4l/by-id/*video-index0"))
+    return cams[0] if cams else None
+
+
+def video_devices():
+    """(path, driver, name) for each video device, asked directly: labels and sysfs links vary between systems."""
+    for path in sorted(glob.glob("/dev/video*")):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            continue
+        try:
+            info = bytearray(104)
+            fcntl.ioctl(fd, VIDIOC_QUERYCAP, info)
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+        field = lambda start, end: bytes(info[start:end]).split(b"\0")[0].decode(errors="replace")
+        yield path, field(0, 16), field(16, 48)
+
+
+def find_loopback(devices=None):
+    """The first v4l2loopback device as (path, name), whatever it's labelled."""
+    for path, driver, name in video_devices() if devices is None else devices:
+        if driver == "v4l2 loopback":
+            return path, name
+    return None
+
+
+def load_rubberband():
+    """librubberband 3.0 or newer (formant control needs it), under whichever name this system uses."""
+    for name in (*RUBBERBAND_NAMES, ctypes.util.find_library("rubberband")):
+        if not name:
+            continue
+        try:
+            lib = ctypes.CDLL(name)
+        except OSError:
+            continue
+        if hasattr(lib, "rubberband_set_formant_scale"):
+            return lib
+    return None
+
+
+def requirements():
+    """(ok, what, effect if missing, PACKAGES key) for everything the app relies on."""
+    results = []
+    try:
+        import gi
+        for namespace, version in (("Gtk", "4.0"), ("Adw", "1"), ("Gst", "1.0"), ("GstApp", "1.0")):
+            gi.require_version(namespace, version)
+        from gi.repository import Adw, Gst, Gtk  # noqa: F401
+        ui = True
+    except (ImportError, ValueError):
+        ui = False
+    results.append((ui, "GTK 4, libadwaita and PyGObject", "the app can't open", "ui"))
+    if ui:
+        Gst.init(None)
+        missing = [name for name in GST_ELEMENTS if not Gst.ElementFactory.find(name)]
+        results.append((not missing, "GStreamer plugins" + (f" (missing: {', '.join(missing)})" if missing else ""),
+                        "camera or voice filters can't run", "gst"))
+    loopback = find_loopback()
+    results.append((loopback is not None, "Virtual camera" + (f" ({loopback[1]})" if loopback else ""),
+                    f"Discord can't see your filtered camera. Load it with:  {LOOPBACK_SETUP}", "loopback"))
+    caps_file = "/sys/module/v4l2loopback/parameters/exclusive_caps"
+    if loopback and os.path.exists(caps_file) and "Y" not in open(caps_file).read():
+        results.append((False, "Virtual camera set up for Discord (exclusive_caps=1)",
+                        f"Discord may not list the camera. Reload it with:  sudo modprobe -r v4l2loopback && {LOOPBACK_SETUP}", None))
+    results.append((find_webcam() is not None, "Webcam", "there's nothing to filter. Plug one in", None))
+    pipewire = bool(shutil.which("pw-loopback") and shutil.which("pactl"))
+    results.append((pipewire, "PipeWire tools (pw-loopback, pactl)", "voice filters are off", "pipewire"))
+    if pipewire:
+        results.append((find_mic() is not None, "Microphone", "voice filters are off", None))
+    results.append((load_rubberband() is not None, "Rubber Band 3.0 or newer",
+                    "the 7 voices that change pitch sound like Normal; the other 6 still work", "rubberband"))
+    return results
+
+
+def report():
+    print(f"\n{APP_NAME} requirements:")
+    results = requirements()
+    for ok, what, effect, package in results:
+        print(f"  {'✓' if ok else '✗'} {what}")
+        if not ok:
+            print(f"      Without it {effect}.")
+            if package:
+                fedora, debian = PACKAGES[package]
+                print(f"      Fedora: sudo dnf install {fedora}\n      Ubuntu/Debian: sudo apt install {debian}")
+    print("\nEverything's ready." if all(ok for ok, *_ in results) else "\nInstall what's marked ✗, then run this again.")
+
+
+def desktop_quote(path):
+    # Desktop-entry rules: \"\`$ and backslash escaped inside quotes, % doubled.
+    escaped = {"\"": "\\\"", "`": "\\`", "$": "\\$", "\\": "\\\\\\\\", "%": "%%"}
+    return '"' + "".join(escaped.get(ch, ch) for ch in path) + '"'
+
+
+def install_paths(home=None):
+    home = home or os.path.expanduser("~")
+    return (os.path.join(home, ".local", "bin", "redbarn-studio"),
+            os.path.join(home, ".local", "share", "icons", "hicolor", "scalable", "apps", f"{APP_ID}.svg"),
+            os.path.join(home, ".local", "share", "applications", f"{APP_ID}.desktop"))
+
+
+def refresh_menus(home=None):
+    home = home or os.path.expanduser("~")
+    for command in (["update-desktop-database", os.path.join(home, ".local", "share", "applications")],
+                    ["gtk-update-icon-cache", "-q", "-t", "-f", os.path.join(home, ".local", "share", "icons", "hicolor")]):
+        if shutil.which(command[0]):
+            subprocess.run(command, capture_output=True)
+
+
+def install(home=None):
+    program, icon, launcher = install_paths(home)
+    for path in (program, icon, launcher):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.realpath(__file__) != os.path.realpath(program):
+        shutil.copyfile(__file__, program)
+    os.chmod(program, 0o755)
+    with open(icon, "w") as f:
+        f.write(ICON_SVG)
+    with open(launcher, "w") as f:
+        f.write(f"""[Desktop Entry]
+Type=Application
+Name={APP_NAME}
+Comment=Cinematic camera looks and voice filters for Discord
+Exec={desktop_quote(program)}
+Icon={APP_ID}
+Categories=AudioVideo;Video;
+StartupWMClass={APP_ID}
+Terminal=false
+""")
+    refresh_menus(home)
+    print(f"Installed {APP_NAME}. Open it from your app menu.")
+    report()
+    print(f"\nIn Discord, under Settings > Voice & Video, choose the virtual camera and {MIC_NAME}.\n"
+          f"Keep {APP_NAME} open while you use them.")
+
+
+def uninstall(home=None):
+    for path in install_paths(home):
+        if os.path.exists(path):
+            os.remove(path)
+    refresh_menus(home)
+    print(f"Removed {APP_NAME} from your app menu.")
+
+
+if __name__ == "__main__" and sys.argv[1:2] in (["--install"], ["--uninstall"], ["--check"]):
+    {"--install": install, "--uninstall": uninstall, "--check": report}[sys.argv[1]]()
+    sys.exit(0)
+
+# Without this, glupload silently delivers blank frames on NVIDIA + Wayland. It needs Xwayland.
+if os.environ.get("DISPLAY"):
+    os.environ.setdefault("GST_GL_WINDOW", "x11")
+
+try:
+    import gi
+
+    gi.require_version("Adw", "1")
+    gi.require_version("Gdk", "4.0")
+    gi.require_version("Gst", "1.0")
+    gi.require_version("GstApp", "1.0")
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Adw, Gdk, GLib, Gst, GstApp, Gtk
+except (ImportError, ValueError):
+    if __name__ != "__main__":
+        raise
+    print(f"{APP_NAME} can't start: some parts it needs aren't installed.")
+    report()
+    sys.exit(1)
+
+CSS = """
+:root { --accent-bg-color: #a32a22; --accent-fg-color: #ffffff; --accent-color: #a32a22; }
+.dark-ui { --accent-color: #ee7a70; }
+.preview { background-color: #000000; border-radius: 14px; }
+.brand { font-weight: 700; }
+.pill { padding: 4px 12px; border-radius: 999px; font-size: 0.85em; font-weight: 600; }
+.live { color: #1a7f37; background-color: alpha(#2da44e, 0.15); }
+.warn { color: #9a6700; background-color: alpha(#d4a72c, 0.2); }
+.stopped { color: #cf222e; background-color: alpha(#cf222e, 0.15); }
+.dark-ui .live { color: #57d07a; }
+.dark-ui .warn { color: #e3b341; }
+.dark-ui .stopped { color: #ff7b72; }
+.copyright { font-size: 0.75em; opacity: 0.6; }
+"""
+
+LOOKS = ["Clean", "Night Vision", "Grainy Film", "Hi-Def", "2008 Webcam", "VHS", "Noir", "CCTV",
+         "Camcorder", "Thermal", "Silent Film", "Blockbuster", "Red Barn"]
+GRAINY_LOOKS = ["Night Vision", "Grainy Film", "VHS", "Noir", "CCTV", "Camcorder", "Silent Film"]
+PREVIEW_WIDTH, PREVIEW_HEIGHT = 640, 360
+
+RU_DAYS = ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
+RU_MONTHS = ["ЯНВ", "ФЕВ", "МАР", "АПР", "МАЙ", "ИЮН", "ИЮЛ", "АВГ", "СЕН", "ОКТ", "НОЯ", "ДЕК"]
+
+
+def russian_date(now):
+    return f"{RU_DAYS[now.weekday()]} {now:%d} {RU_MONTHS[now.month - 1]} {now:%Y}  {now:%H:%M:%S}"
+
+
+def camcorder_date(now):
+    return now.strftime("%b %d %Y  %I:%M:%S %p").upper()
+
+
+# Looks with an on-screen display: text colour (ARGB), record word, label, date format.
+OVERLAYS = {
+    "Night Vision": (0xFF66FF77, "ЗАП", "НОЧНОЙ РЕЖИМ", russian_date),
+    "CCTV": (0xFFFFFFFF, "ЗАП", "КАМЕРА 03", russian_date),
+    "Camcorder": (0xFFFFFFFF, "REC", "SP", camcorder_date),
+}
+
+# One shader with a mode uniform: glshader ignores new fragment source while
+# playing, and restarting the pipeline would drop the camera from Discord.
+SHADER = """#version 110
+varying vec2 v_texcoord;
+uniform sampler2D tex;
+uniform float time;
+uniform float mode;
+
+const vec2 PX = vec2(1.0 / 1280.0, 1.0 / 720.0);
+
+float rand(vec2 p) {
+  return fract(sin(dot(p, vec2(12.9898, 78.233)) + fract(time) * 311.7) * 43758.5453);
+}
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+float grain(vec2 uv, float amount) { return (rand(uv) - 0.5) * amount; }
+float vignette(vec2 uv, float amount) {
+  vec2 d = uv - 0.5;
+  return clamp(1.0 - dot(d, d) * 2.0 * amount, 0.0, 1.0);
+}
+float scanlines(vec2 uv, float lines, float amount) {
+  return 1.0 - amount * step(0.5, fract(uv.y * lines));
+}
+vec3 get(vec2 uv) { return texture2D(tex, uv).rgb; }
+
+vec3 night_vision(vec2 uv) {
+  float g = pow(luma(get(uv)), 0.6) * 1.5 + grain(uv, 0.22);
+  return vec3(0.08, 1.0, 0.14) * g * vignette(uv, 1.4);
+}
+vec3 grainy_film(vec2 uv) {
+  vec3 c = mix(vec3(0.07, 0.06, 0.05), vec3(1.0, 0.95, 0.85), get(uv));
+  float flicker = 1.0 + 0.025 * sin(time * 37.0);
+  return (c + grain(uv, 0.16)) * flicker * vignette(uv, 0.8);
+}
+vec3 hi_def(vec2 uv) {
+  vec3 c = get(uv);
+  vec2 o = PX * 1.5;
+  vec3 blur = (get(uv + vec2(o.x, 0.0)) + get(uv - vec2(o.x, 0.0))
+             + get(uv + vec2(0.0, o.y)) + get(uv - vec2(0.0, o.y))) * 0.25;
+  c += (c - blur) * 1.3;
+  c = (c - 0.5) * 1.15 + 0.5;
+  return mix(vec3(luma(c)), c, 1.25);
+}
+vec3 webcam_2008(vec2 uv) {
+  vec2 grid = vec2(320.0, 180.0);
+  vec3 c = get((floor(uv * grid) + 0.5) / grid);
+  c = floor(c * 20.0 + 0.5) / 20.0;
+  c = pow(c, vec3(0.8)) * 1.15 * vec3(0.92, 1.0, 1.08);
+  return c + grain(uv, 0.03);
+}
+vec3 vhs(vec2 uv) {
+  uv.x += sin(uv.y * 30.0 + time * 3.0) * 0.0015;
+  float band = abs(uv.y - fract(time * 0.13));
+  if (band < 0.02) uv.x += 0.012;
+  vec3 c = vec3(get(uv + vec2(0.004, 0.0)).r, get(uv).g, get(uv - vec2(0.004, 0.0)).b);
+  c = mix(vec3(luma(c)), c, 0.8);
+  c += grain(uv, band < 0.02 ? 0.35 : 0.06);
+  return c * scanlines(uv, 240.0, 0.12);
+}
+vec3 noir(vec2 uv) {
+  float g = smoothstep(0.1, 0.85, luma(get(uv))) + grain(uv, 0.1);
+  return vec3(g) * vignette(uv, 1.0);
+}
+vec3 cctv(vec2 uv) {
+  vec3 c = get(uv);
+  c = mix(vec3(luma(c)), c, 0.15) * vec3(0.92, 1.0, 0.96);
+  c = (c - 0.5) * 1.2 + 0.5 + grain(uv, 0.12);
+  return c * scanlines(uv, 288.0, 0.14) * vignette(uv, 1.3);
+}
+vec3 camcorder(vec2 uv) {
+  vec2 o = PX * 1.2;
+  vec3 c = (get(uv + vec2(o.x, 0.0)) + get(uv - vec2(o.x, 0.0))
+          + get(uv + vec2(0.0, o.y)) + get(uv - vec2(0.0, o.y)) + get(uv) * 4.0) * 0.125;
+  c.r = get(uv + vec2(0.0015, 0.0)).r;
+  c = pow(c, vec3(0.9)) * vec3(1.06, 1.0, 0.92) + grain(uv, 0.05);
+  c *= scanlines(uv, 480.0, 0.08);
+  vec2 d = abs(uv - 0.5);
+  bool arm_x = abs(d.y - 0.484) < 0.002 && d.x > 0.43 && d.x < 0.485;
+  bool arm_y = abs(d.x - 0.485) < 0.0012 && d.y > 0.40 && d.y < 0.486;
+  return arm_x || arm_y ? vec3(0.95) : c;
+}
+vec3 thermal(vec2 uv) {
+  vec2 o = PX * 3.0;
+  float t = luma(get(uv) + get(uv + o) + get(uv - o) + get(uv + vec2(o.x, -o.y))) * 0.25;
+  t = pow(clamp(t, 0.0, 1.0), 0.7);
+  vec3 c = mix(vec3(0.02, 0.0, 0.25), vec3(0.6, 0.0, 0.7), smoothstep(0.0, 0.33, t));
+  c = mix(c, vec3(1.0, 0.35, 0.0), smoothstep(0.33, 0.66, t));
+  return mix(c, vec3(1.0, 1.0, 0.6), smoothstep(0.66, 1.0, t));
+}
+vec3 silent_film(vec2 uv) {
+  uv.y += (rand(vec2(1.0, 7.0)) - 0.5) * 0.006;
+  float g = (pow(luma(get(uv)), 0.7) - 0.5) * 1.2 + 0.58 + grain(uv, 0.14);
+  float scratch = 1.0 - step(abs(uv.x - rand(vec2(1.0, 2.0))), 0.0008) * step(0.6, rand(vec2(3.0, 4.0))) * 0.6;
+  float dust = 1.0 - step(0.9995, rand(floor(uv * vec2(320.0, 180.0)))) * 0.8;
+  float flicker = 1.0 + 0.06 * sin(time * 40.0);
+  return vec3(1.0, 0.86, 0.62) * g * scratch * dust * flicker * vignette(uv, 0.8);
+}
+vec3 blockbuster(vec2 uv) {
+  if (abs(uv.y - 0.5) > 0.372) return vec3(0.0);
+  vec3 c = clamp(get(uv), 0.0, 1.0);
+  float l = luma(c);
+  c = mix(c, c * c * (3.0 - 2.0 * c), 0.6);
+  c *= mix(vec3(0.85, 1.0, 1.1), vec3(1.12, 1.0, 0.82), smoothstep(0.2, 0.7, l));
+  return mix(vec3(luma(c)), c, 1.15);
+}
+float barn_noise(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);  // no time: wood mustn't shimmer
+}
+float wood_grain(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(barn_noise(i), barn_noise(i + vec2(1.0, 0.0)), f.x),
+             mix(barn_noise(i + vec2(0.0, 1.0)), barn_noise(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float fbm(vec2 p) {
+  float v = 0.0, amp = 0.5;
+  for (int i = 0; i < 4; i++) {
+    v += amp * wood_grain(p);
+    p *= 2.03;
+    amp *= 0.5;
+  }
+  return v;
+}
+// Positive inside a trim board, measured in pixels to its nearest edge. Door is 256 x 648 px.
+float trim_depth(vec2 px) {
+  const float W = 256.0, H = 648.0;
+  float frame = 20.0 - min(min(px.x, W - px.x), min(px.y, H - px.y));
+  float rail = 12.0 - abs(px.y - H * 0.5);
+  vec2 q = vec2(px.x - 20.0, mod(px.y, H * 0.5) - 20.0) / vec2(W - 40.0, H * 0.5 - 40.0);
+  float len = length(vec2(W - 40.0, H * 0.5 - 40.0));
+  float brace = 15.0 - min(abs(q.x - q.y), abs(q.x + q.y - 1.0)) * (W - 40.0) * (H * 0.5 - 40.0) / len;
+  return max(max(frame, rail), brace);
+}
+vec3 barn_door(vec2 d, float side) {
+  vec2 px = d * vec2(256.0, 648.0);
+  vec2 seed = vec2(side * 37.0, side * 11.0);
+  float plank = floor(d.x * 5.0);
+  float fx = fract(d.x * 5.0);
+  float grain = fbm(vec2(px.x * 0.3 + plank * 13.0, px.y * 0.01) + seed);
+  float wear = fbm(px * 0.035 + seed + 50.0);
+  float seam = smoothstep(0.0, 0.035, fx) * smoothstep(0.0, 0.035, 1.0 - fx);
+
+  vec3 paint = vec3(0.55, 0.11, 0.08) * (0.82 + 0.28 * barn_noise(vec2(plank, 3.0) + seed)) * (0.72 + 0.45 * grain);
+  paint = mix(paint, paint * 1.18 + vec3(0.05, 0.03, 0.03), smoothstep(0.45, 0.0, d.y) * 0.5);  // sun-faded top
+  vec3 bare = vec3(0.5, 0.44, 0.37) * (0.7 + 0.45 * grain);
+  // Worn spots gather low down and along plank edges, where real paint fails first.
+  float chipped = smoothstep(0.74, 0.77, wear + 0.14 * d.y * d.y + 0.1 * abs(fx - 0.5));
+  float depth = trim_depth(px);
+  vec3 c;
+  if (depth > 0.0) {
+    vec3 white = vec3(0.83, 0.79, 0.7) * (0.74 + 0.32 * grain);
+    white = mix(white, bare, smoothstep(0.76, 0.8, wear + 0.12 * d.y * d.y) * 0.7);
+    c = white * mix(0.62, 1.0, smoothstep(0.0, 4.0, depth));  // bevelled board edges
+  } else {
+    c = mix(paint, bare, chipped) * mix(0.22, 1.0, seam);
+    c *= trim_depth(px + vec2(-5.0, -6.0)) > 0.0 ? 0.55 : 1.0;  // trim casts a shadow onto the planks
+  }
+  c *= mix(vec3(1.0), vec3(0.72, 0.62, 0.5), smoothstep(0.82, 1.0, d.y));  // dirt near the ground
+  c *= mix(0.55, 1.08, d.x);  // light comes from the doorway, so the outer side is darker
+  c *= mix(0.45, 1.0, smoothstep(1.0, 0.985, d.x));  // door thickness on the inner edge
+
+  for (float h = 0.0; h < 2.0; h += 1.0) {  // hanger straps up to the track, with bolts
+    float hx = 64.0 + h * 128.0;
+    if (abs(px.x - hx) < 9.0 && px.y < 46.0) {
+      vec3 iron = vec3(0.09, 0.09, 0.1) * (0.8 + 0.4 * grain);
+      for (float b = 0.0; b < 2.0; b += 1.0) {
+        float bolt = length(px - vec2(hx, 14.0 + b * 20.0));
+        iron = mix(iron, vec3(0.35, 0.33, 0.3), smoothstep(3.5, 2.0, bolt));
+        iron = mix(iron, vec3(0.7, 0.66, 0.6), smoothstep(1.6, 0.4, length(px - vec2(hx - 1.0, 13.0 + b * 20.0))));
+      }
+      c = iron;
+    }
+  }
+  return c;
+}
+vec3 red_barn(vec2 uv) {
+  const float door = 0.2, beam = 0.1;
+  if (uv.y < beam) {
+    float grain = fbm(vec2(uv.x * 9.0, uv.y * 90.0));
+    float crack = smoothstep(0.03, 0.0, abs(fract(uv.y * 31.0 + fbm(vec2(uv.x * 4.0, 2.0)) * 0.8) - 0.5) - 0.47);
+    vec3 wood = vec3(0.36, 0.23, 0.13) * (0.5 + 0.85 * grain) * (1.0 - 0.55 * crack);
+    wood *= mix(0.7, 1.0, uv.y / beam);
+    if (uv.y > beam - 0.022 && uv.y < beam - 0.006) {  // iron sliding-door track
+      wood = vec3(0.08, 0.08, 0.09) + vec3(0.22, 0.21, 0.2) * smoothstep(0.003, 0.0, abs(uv.y - (beam - 0.019)));
+    }
+    return wood;
+  }
+  float y = (uv.y - beam) / (1.0 - beam);
+  if (uv.x < door) return barn_door(vec2(uv.x / door, y), 0.0);
+  if (uv.x > 1.0 - door) return barn_door(vec2((1.0 - uv.x) / door, y), 1.0);
+  vec3 c = pow(clamp(get(uv), 0.0, 1.0), vec3(0.82)) * vec3(1.14, 0.98, 0.72);
+  c = mix(c, vec3(0.9, 0.66, 0.36), 0.1);
+  float shade = smoothstep(door - 0.02, door + 0.15, uv.x) * smoothstep(1.0 - door + 0.02, 1.0 - door - 0.15, uv.x)
+              * smoothstep(beam - 0.02, beam + 0.16, uv.y);
+  c *= mix(0.5, 1.0, shade);
+  float rays = smoothstep(0.55, 1.0, sin((uv.x + uv.y * 0.55) * 15.0 + fbm(vec2(uv.x * 3.0, 1.0)) * 4.0) * 0.5 + 0.5);
+  c += vec3(1.0, 0.8, 0.5) * rays * 0.06 * (1.0 - uv.y);  // soft light shafts through the doorway
+  for (float layer = 1.0; layer < 3.0; layer += 1.0) {
+    vec2 p = uv * vec2(16.0, 9.0) * layer + vec2(sin(time * 0.12 + layer) * 0.5, time * 0.07 * layer);
+    vec2 cell = floor(p);
+    vec2 centre = vec2(barn_noise(cell), barn_noise(cell + 5.0)) * 0.6 + 0.2;
+    float mote = smoothstep(0.05, 0.0, length(fract(p) - centre)) * step(0.72, barn_noise(cell + layer));
+    c += vec3(1.0, 0.84, 0.55) * mote * 0.25;
+  }
+  return c;
+}
+
+void main() {
+  vec2 uv = v_texcoord;
+  vec3 c;
+  if (mode < 0.5) c = get(uv);
+  else if (mode < 1.5) c = night_vision(uv);
+  else if (mode < 2.5) c = grainy_film(uv);
+  else if (mode < 3.5) c = hi_def(uv);
+  else if (mode < 4.5) c = webcam_2008(uv);
+  else if (mode < 5.5) c = vhs(uv);
+  else if (mode < 6.5) c = noir(uv);
+  else if (mode < 7.5) c = cctv(uv);
+  else if (mode < 8.5) c = camcorder(uv);
+  else if (mode < 9.5) c = thermal(uv);
+  else if (mode < 10.5) c = silent_film(uv);
+  else if (mode < 11.5) c = blockbuster(uv);
+  else c = red_barn(uv);
+  gl_FragColor = vec4(c, 1.0);
+}
+"""
+
+FILTER_CHAIN = (
+    "videoconvert ! video/x-raw,format=RGBA ! videoflip name=camera_flip ! glupload ! glcolorconvert ! glshader name=fx "
+    "! gldownload ! videoconvert ! video/x-raw,format=YUY2"
+    # After the shader: the vignettes black out the corners this text sits in.
+    # Flipped either side of the text so only the text mirrors, never the picture.
+    ' ! videoflip name=flip_in video-direction=horiz'
+    ' ! textoverlay name=rec text=● color=0xFFFF2020 silent=true valignment=top halignment=left'
+    ' font-desc="Liberation Mono Bold 15" xpad=30 ypad=24'
+    ' ! textoverlay name=info silent=true valignment=top halignment=left'
+    ' font-desc="Liberation Mono Bold 15" xpad=60 ypad=24'
+    ' ! textoverlay name=stamp silent=true valignment=bottom halignment=left line-alignment=left'
+    ' font-desc="Liberation Mono Bold 15" xpad=30 ypad=24'
+    ' ! videoflip name=flip_out video-direction=horiz'
+)
+
+
+# Mono through the effects, stereo out. One fixed chain: voices only change element
+# settings, so switching never restarts the stream Discord is listening to.
+VOICE_CHAIN = (
+    "audioconvert ! audioresample ! audio/x-raw,format=F32LE,channels=1,rate=48000 "
+    "! appsink name=shifter_in emit-signals=true sync=false "
+    'appsrc name=shifter_out is-live=true format=time do-timestamp=true '
+    'caps="audio/x-raw,format=F32LE,channels=1,rate=48000,layout=interleaved" '
+    "! audiocheblimit name=highpass mode=high-pass poles=4 ! audiocheblimit name=lowpass mode=low-pass poles=4 "
+    "! audioamplify name=drive clipping-method=clip ! audioecho name=echo max-delay=500000000 "
+    "! freeverb name=reverb room-size=0.85 ! audioconvert ! audio/x-raw,format=F32LE,channels=2,rate=48000"
+)
+# Each voice lists only what differs from set_voice's defaults. echo: delay ms, intensity, feedback.
+# formant moves the voice's resonance: left out it follows pitch, which is what makes Chipmunk sound
+# small. Child and Female keep it lower than pitch so they read as a person, not sped-up tape.
+VOICES = {
+    "Normal": {},
+    "Deep": {"pitch": 0.75},
+    "Chipmunk": {"pitch": 1.6},
+    "Child": {"pitch": 1.7, "formant": 1.3, "highpass": 150.0},
+    "Female": {"pitch": 1.5, "formant": 1.15, "highpass": 120.0},
+    "Male": {"pitch": 0.8, "formant": 0.9, "highpass": 80.0},
+    "Robot": {"pitch": 0.92, "echo": (12, 0.7, 0.6)},
+    "Walkie-Talkie": {"highpass": 400.0, "lowpass": 2800.0, "drive": 3.0},
+    "Cave": {"echo": (180, 0.45, 0.45), "reverb": 0.45},
+    "Demon": {"pitch": 0.62, "reverb": 0.3},
+    "Alien": {"pitch": 1.2, "formant": 0.7, "echo": (10, 0.5, 0.45), "drive": 1.3},
+    "Ghost": {"pitch": 1.06, "formant": 1.15, "highpass": 250.0, "echo": (260, 0.4, 0.4), "reverb": 0.55},
+    "Ghostface": {"pitch": 0.78, "formant": 0.85, "highpass": 120.0, "lowpass": 4000.0, "drive": 1.8, "echo": (8, 0.35, 0.3)},
+}
+RUBBERBAND_MISSING = "This voice needs the Rubber Band library, so it sounds like Normal. Run redbarn-studio --check."
+MIC_LOST = f"No sound is reaching {APP_NAME} from your mic. Check it's plugged in."
+# Separate process: a playback fault must never reach what Discord receives.
+MONITOR_CMD = ["pw-loopback", "--name=redbarn-monitor", f"--capture={MIC_NODE}"]
+MIC_PROPS = "node.dont-fallback=true priority.session=1 priority.driver=1 audio.position=[FL FR]"
+
+
+class PitchShifter:
+    """Pitch and formant shifting through librubberband, which has no GStreamer element."""
+    # Real-time, HighConsistency (allows live changes), FormantPreserved, ThreadingNever, R3 engine.
+    OPTIONS = 0x1 | 0x4000000 | 0x1000000 | 0x10000 | 0x20000000
+    BLOCK = 8192
+
+    def __init__(self):
+        self.wanted = self.applied = (1.0, 1.0)
+        lib = self.lib = load_rubberband()
+        if lib is None:
+            return  # pitch voices pass audio through unchanged, and the app says why
+        lib.rubberband_new.restype = ctypes.c_void_p
+        lib.rubberband_new.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_int, ctypes.c_double, ctypes.c_double]
+        lib.rubberband_set_pitch_scale.argtypes = [ctypes.c_void_p, ctypes.c_double]
+        lib.rubberband_set_formant_scale.argtypes = [ctypes.c_void_p, ctypes.c_double]
+        lib.rubberband_set_max_process_size.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        lib.rubberband_reset.argtypes = [ctypes.c_void_p]
+        lib.rubberband_process.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int]
+        lib.rubberband_available.argtypes = [ctypes.c_void_p]
+        lib.rubberband_retrieve.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        lib.rubberband_retrieve.restype = ctypes.c_uint
+        self.state = lib.rubberband_new(48000, 1, self.OPTIONS, 1.0, 1.0)
+        lib.rubberband_set_max_process_size(self.state, self.BLOCK)
+        self.input = (ctypes.c_float * self.BLOCK)()
+        self.output = (ctypes.c_float * self.BLOCK)()
+        self.input_ptr = (ctypes.c_void_p * 1)(ctypes.addressof(self.input))
+        self.output_ptr = (ctypes.c_void_p * 1)(ctypes.addressof(self.output))
+        self.wanted = self.applied = (1.0, 1.0)
+
+    def want(self, pitch, formant):
+        # Applied by process(): rubberband isn't safe to change from another thread mid-block.
+        self.wanted = (pitch, formant)
+
+    def process(self, data):
+        if self.lib is None:
+            return data
+        pitch, formant = self.wanted
+        if self.wanted != self.applied:
+            if self.applied == (1.0, 1.0):
+                self.lib.rubberband_reset(self.state)
+            self.lib.rubberband_set_pitch_scale(self.state, pitch)
+            # Rubberband's scale is relative to the pitch shift, so this gives formant overall.
+            self.lib.rubberband_set_formant_scale(self.state, formant / pitch)
+            self.applied = self.wanted
+        if self.wanted == (1.0, 1.0):
+            return data  # Normal skips the engine, and its delay, entirely
+        samples = len(data) // 4
+        ctypes.memmove(self.input, data, samples * 4)
+        self.lib.rubberband_process(self.state, self.input_ptr, samples, 0)
+        result = bytearray()
+        while (available := self.lib.rubberband_available(self.state)) > 0:
+            got = self.lib.rubberband_retrieve(self.state, self.output_ptr, min(available, self.BLOCK))
+            result += bytes(self.output)[:got * 4]
+        return bytes(result)
+
+
+def attach_shifter(pipeline):
+    shifter = pipeline.shifter = PitchShifter()
+    source = pipeline.get_by_name("shifter_out")
+
+    def forward(sink, pull):
+        buffer = sink.emit(pull).get_buffer()
+        output = shifter.process(buffer.extract_dup(0, buffer.get_size()))
+        if output:
+            source.push_buffer(Gst.Buffer.new_wrapped(output))
+        return Gst.FlowReturn.OK
+
+    # Preroll too: the pipeline won't start until the first audio reaches its final sink.
+    sink = pipeline.get_by_name("shifter_in")
+    sink.connect("new-preroll", forward, "pull-preroll")
+    sink.connect("new-sample", forward, "pull-sample")
+
+
+def set_voice(pipeline, name):
+    voice = VOICES[name]
+    delay_ms, intensity, feedback = voice.get("echo", (1, 0.0, 0.0))
+    pitch = voice.get("pitch", 1.0)
+    pipeline.shifter.want(pitch, voice.get("formant", pitch))
+    pipeline.get_by_name("highpass").set_property("cutoff", voice.get("highpass", 20.0))
+    pipeline.get_by_name("lowpass").set_property("cutoff", voice.get("lowpass", 20000.0))
+    pipeline.get_by_name("drive").set_property("amplification", voice.get("drive", 1.0))
+    echo = pipeline.get_by_name("echo")
+    echo.set_property("delay", delay_ms * Gst.MSECOND)
+    echo.set_property("intensity", intensity)
+    echo.set_property("feedback", feedback)
+    pipeline.get_by_name("reverb").set_property("level", voice.get("reverb", 0.0))
+
+
+def stop_process(process):
+    process.terminate()
+    try:
+        process.wait(2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
+def die_with_parent():
+    ctypes.CDLL(None).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG: no silent mic left behind after a crash
+
+
+def start_virtual_mic():
+    # pw-loopback, not pipewiresink mode=provide: that makes a mic that lists fine but carries no audio.
+    process = subprocess.Popen([
+        "pw-loopback", "--name=redbarn",
+        f'--capture-props=media.class=Audio/Sink node.name={OUTPUT_NODE} node.description="Redbarn Output" {MIC_PROPS}',
+        f'--playback-props=media.class=Audio/Source node.name={MIC_NODE} node.description="{MIC_NAME}" {MIC_PROPS}',
+    ], preexec_fn=die_with_parent)
+    for _ in range(30):
+        if OUTPUT_NODE in pactl("list", "short", "sinks"):
+            return process
+        time.sleep(0.1)
+    process.terminate()
+    return None
+
+
+def build_voice_pipeline(mic):
+    pipeline = Gst.parse_launch(
+        f'pulsesrc name=mic device="{mic}" buffer-time=40000 latency-time=10000 ! {VOICE_CHAIN} '
+        f"! pulsesink name=voice_out device={OUTPUT_NODE} buffer-time=40000 latency-time=10000 sync=false"
+    )
+    attach_shifter(pipeline)
+    set_voice(pipeline, "Normal")
+    return pipeline
+
+
+def set_look(fx, name):
+    uniforms = f"uniforms, mode=(float){LOOKS.index(name)}.0"
+    fx.set_property("uniforms", Gst.Structure.new_from_string(uniforms))
+
+
+def set_overlay(pipeline, look, blink=True):
+    rec, info, stamp = (pipeline.get_by_name(name) for name in ("rec", "info", "stamp"))
+    style = OVERLAYS.get(look)
+    rec.set_property("silent", style is None or not blink)
+    info.set_property("silent", style is None)
+    stamp.set_property("silent", style is None)
+    if style:
+        colour, word, label, date = style
+        info.set_property("color", colour)
+        info.set_property("text", word)
+        stamp.set_property("color", colour)
+        stamp.set_property("text", f"{label}\n{date(datetime.now())}")
+
+
+def set_text_mirrored(pipeline, mirrored):
+    for name in ("flip_in", "flip_out"):
+        Gst.util_set_object_arg(pipeline.get_by_name(name), "video-direction", "horiz" if mirrored else "identity")
+
+
+def set_camera_flipped(pipeline, flipped):
+    Gst.util_set_object_arg(pipeline.get_by_name("camera_flip"), "video-direction", "horiz" if flipped else "identity")
+
+
+def build_camera_pipeline(cam, loopback):
+    pipeline = Gst.parse_launch(
+        f"v4l2src name=cam device={cam} ! image/jpeg,width=1280,height=720,framerate=30/1 "
+        f"! jpegdec ! {FILTER_CHAIN} ! tee name=t "
+        f"t. ! queue ! v4l2sink name=out device={loopback} sync=false "
+        # appsink, not gtk4paintablesink: that shares GTK's Wayland GL context with
+        # glshader, which brings back the blank-frame path GST_GL_WINDOW=x11 avoids.
+        "t. ! queue leaky=downstream max-size-buffers=2 ! videoscale ! videoconvert "
+        f"! video/x-raw,format=RGBA,width={PREVIEW_WIDTH},height={PREVIEW_HEIGHT} "
+        "! appsink name=preview sync=false drop=true max-buffers=1 emit-signals=true"
+    )
+    fx = pipeline.get_by_name("fx")
+    fx.set_property("fragment", SHADER)
+    set_look(fx, LOOKS[0])
+    return pipeline
+
+
+def error_hint(message):
+    _, debug = message.parse_error()
+    source = message.src.get_name()
+    if source == "out":
+        return f"Can't write to the virtual camera. Close OBS Virtual Camera, then reopen {APP_NAME}."
+    if source == "cam":
+        return f"The webcam stopped. Check it's plugged in and not in use, then reopen {APP_NAME}."
+    return f"Video error: {message.parse_error()[0].message} ({debug})"
+
+
+class RedbarnStudio(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+        self.pipeline = None
+        self.voice_pipeline = None
+        self.virtual_mic = None
+        self.monitor_process = None
+        self.last_mic_audio = 0
+        self.look = LOOKS[0]
+        self.blink = True
+        self.problems = {}
+        self.camera_group = None
+
+    def do_activate(self):
+        # Reopening from the launcher lands here: starting again would kill the live stream.
+        if self.get_active_window():
+            self.get_active_window().present()
+            return
+        provider = Gtk.CssProvider()
+        provider.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        Gtk.Window.set_default_icon_name(APP_ID)
+        window = Adw.ApplicationWindow(application=self, title=APP_NAME, default_width=1040, default_height=680)
+        window.add_css_class("dark-ui")
+        window.set_size_request(760, 600)
+
+        brand = Gtk.Box(spacing=8)
+        brand.append(Gtk.Image(icon_name=APP_ID, pixel_size=24))
+        brand.append(Gtk.Label(label=APP_NAME, css_classes=["brand"]))
+        header = Adw.HeaderBar(title_widget=brand)
+        self.status = Gtk.Label(css_classes=["pill"])
+        self.voice_status = Gtk.Label(css_classes=["pill"])
+        header.pack_start(self.status)
+        header.pack_start(self.voice_status)
+        self.banner = Adw.Banner()
+        copyright_line = Gtk.Label(label=COPYRIGHT, css_classes=["copyright"], margin_top=6, margin_bottom=6)
+
+        self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, css_classes=["preview"], overflow=Gtk.Overflow.HIDDEN)
+        frame = Gtk.AspectFrame(ratio=16 / 9, obey_child=False, hexpand=True, vexpand=True, child=self.picture)
+        stage = Gtk.Box(margin_start=16, margin_end=8, margin_top=8, margin_bottom=8)
+        stage.append(frame)
+
+        self.look_menu = Adw.ComboRow(title="Look", model=Gtk.StringList.new(LOOKS))
+        self.look_menu.connect("notify::selected", self.on_look)
+        # Discord mirrors your own view of your camera, so correct text can look backwards to you alone.
+        self.mirror = Adw.SwitchRow(title="Mirror overlay text", subtitle="Turn off if viewers see it backwards", active=True)
+        self.mirror.connect("notify::active", self.on_mirror)
+        self.flip_camera = Adw.SwitchRow(title="Flip camera")
+        self.flip_camera.connect("notify::active", self.on_flip_camera)
+        self.voice_menu = Adw.ComboRow(title="Voice", model=Gtk.StringList.new(list(VOICES)))
+        self.voice_menu.connect("notify::selected", self.on_voice)
+        self.monitor = Adw.SwitchRow(title="Hear my voice", subtitle="Use headphones to avoid feedback")
+        self.monitor.connect("notify::active", self.on_monitor)
+        self.dark = Adw.SwitchRow(title="Dark mode", active=True)
+        self.dark.connect("notify::active", self.on_dark)
+
+        settings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_start=8, margin_end=16, margin_top=8, margin_bottom=8)
+        for title, description, rows in (
+            ("Camera", "In Discord, choose the virtual camera.", (self.look_menu, self.mirror, self.flip_camera)),
+            ("Voice", f"In Discord, choose {MIC_NAME} as input.", (self.voice_menu, self.monitor)),
+            ("Appearance", None, (self.dark,)),
+        ):
+            group = Adw.PreferencesGroup(title=title, description=description)
+            for row in rows:
+                group.add(row)
+            settings.append(group)
+            self.camera_group = self.camera_group if title != "Camera" else group
+        panel = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True, width_request=340, child=settings)
+
+        body = Gtk.Box()
+        body.append(stage)
+        body.append(panel)
+        view = Adw.ToolbarView(content=body)
+        view.add_top_bar(header)
+        view.add_top_bar(self.banner)
+        view.add_bottom_bar(copyright_line)
+        window.set_content(view)
+        window.connect("close-request", self.on_close)
+        window.present()
+        self.start()
+        self.start_voice()
+
+    def set_status(self, pill, level, text, problem=None):
+        pill.set_text(f"● {text}")
+        pill.set_css_classes(["pill", level])
+        self.problems[pill] = problem
+        problems = [p for p in self.problems.values() if p]
+        self.banner.set_title(" ".join(problems))
+        self.banner.set_revealed(bool(problems))
+
+    def camera_off(self, reason):
+        self.set_status(self.status, "stopped", "Camera off", reason)
+
+    def start(self):
+        cam, loopback = find_webcam(), find_loopback()
+        if not cam:
+            self.camera_off(f"No webcam found. Plug it in, then reopen {APP_NAME}.")
+            return
+        if not loopback:
+            self.camera_off("Virtual camera not found. Run redbarn-studio --check for setup help.")
+            return
+        loopback_path, loopback_name = loopback
+        self.camera_group.set_description(f"In Discord, choose “{GLib.markup_escape_text(loopback_name)}”.")
+        try:
+            self.pipeline = build_camera_pipeline(cam, loopback_path)
+        except GLib.Error as e:
+            self.camera_off(f"Couldn't set up video: {e.message}")
+            return
+        self.pipeline.get_by_name("preview").connect("new-sample", self.on_preview)
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_error)
+        self.pipeline.set_state(Gst.State.PLAYING)
+        GLib.timeout_add(500, self.tick)
+        self.set_status(self.status, "live", "Camera live")
+
+    def start_voice(self):
+        # Separate from the camera on purpose: a mic problem must not stop the video, or the reverse.
+        try:
+            mic = find_mic()
+            if not mic:
+                self.voice_off("No microphone found, so voice filters are off.")
+                return
+            self.virtual_mic = start_virtual_mic()
+            if not self.virtual_mic:
+                self.voice_off("Couldn't create the virtual mic, so voice filters are off.")
+                return
+            self.voice_pipeline = build_voice_pipeline(mic)
+        except (GLib.Error, OSError, subprocess.SubprocessError) as e:
+            self.voice_off(f"Voice filters are off: {e}")
+            return
+        bus = self.voice_pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_voice_error)
+        self.voice_pipeline.get_by_name("mic").get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, self.on_mic_audio)
+        self.last_mic_audio = time.monotonic()
+        self.voice_pipeline.set_state(Gst.State.PLAYING)
+        self.set_status(self.voice_status, "live", "Mic live")
+        GLib.timeout_add_seconds(1, self.check_mic)
+
+    def on_mic_audio(self, _pad, _info):
+        self.last_mic_audio = time.monotonic()
+        return Gst.PadProbeReturn.OK
+
+    def check_mic(self):
+        # A missing mic raises no error: pulsesrc just waits, and Discord would get silence.
+        if not self.voice_pipeline:
+            return False
+        if self.monitor_process and self.monitor_process.poll() is not None:
+            self.monitor.set_active(False)
+        voice = VOICES[list(VOICES)[self.voice_menu.get_selected()]]
+        if time.monotonic() - self.last_mic_audio > 2:
+            self.set_status(self.voice_status, "warn", "No mic audio", MIC_LOST)
+        elif self.voice_pipeline.shifter.lib is None and ("pitch" in voice or "formant" in voice):
+            self.set_status(self.voice_status, "warn", "Voice unavailable", RUBBERBAND_MISSING)
+        else:
+            self.set_status(self.voice_status, "live", "Mic live")
+        return True
+
+    def voice_off(self, reason):
+        self.voice_menu.set_sensitive(False)
+        self.monitor.set_active(False)
+        self.monitor.set_sensitive(False)
+        self.set_status(self.voice_status, "stopped", "Mic off", reason)
+
+    def on_preview(self, sink):
+        buffer = sink.emit("pull-sample").get_buffer()
+        GLib.idle_add(self.show_preview, GLib.Bytes.new(buffer.extract_dup(0, buffer.get_size())))
+        return Gst.FlowReturn.OK
+
+    def show_preview(self, pixels):
+        self.picture.set_paintable(Gdk.MemoryTexture.new(
+            PREVIEW_WIDTH, PREVIEW_HEIGHT, Gdk.MemoryFormat.R8G8B8A8, pixels, PREVIEW_WIDTH * 4))
+        return False
+
+    def tick(self):
+        self.blink = not self.blink
+        set_overlay(self.pipeline, self.look, self.blink)
+        return True
+
+    def on_look(self, menu, _param):
+        self.look = LOOKS[menu.get_selected()]
+        if self.pipeline:
+            set_look(self.pipeline.get_by_name("fx"), self.look)
+            set_overlay(self.pipeline, self.look, self.blink)
+
+    def on_voice(self, menu, _param):
+        if self.voice_pipeline:
+            set_voice(self.voice_pipeline, list(VOICES)[menu.get_selected()])
+            self.check_mic()
+
+    def on_mirror(self, row, _param):
+        if self.pipeline:
+            set_text_mirrored(self.pipeline, row.get_active())
+
+    def on_flip_camera(self, row, _param):
+        if self.pipeline:
+            set_camera_flipped(self.pipeline, row.get_active())
+
+    def on_monitor(self, row, _param):
+        if row.get_active():
+            self.monitor_process = subprocess.Popen(MONITOR_CMD, preexec_fn=die_with_parent)
+        elif self.monitor_process:
+            stop_process(self.monitor_process)
+            self.monitor_process = None
+
+    def on_dark(self, row, _param):
+        dark = row.get_active()
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK if dark else Adw.ColorScheme.FORCE_LIGHT)
+        # Our own colours need this class: CSS media queries don't follow a forced colour scheme.
+        (self.get_active_window().add_css_class if dark else self.get_active_window().remove_css_class)("dark-ui")
+
+    def on_error(self, _bus, message):
+        self.camera_off(error_hint(message))
+        self.pipeline.set_state(Gst.State.NULL)
+
+    def on_voice_error(self, _bus, message):
+        self.voice_off(f"Voice filters stopped: {message.parse_error()[0].message}. The camera is unaffected.")
+        self.voice_pipeline.set_state(Gst.State.NULL)
+        self.voice_pipeline = None
+
+    def on_close(self, _window):
+        for pipeline in (self.pipeline, self.voice_pipeline):
+            if pipeline:
+                pipeline.set_state(Gst.State.NULL)
+        for process in (self.monitor_process, self.virtual_mic):
+            if process:
+                stop_process(process)
+        return False
+
+
+def pull_bytes(sink):
+    sample = sink.emit("try-pull-sample", 2 * Gst.SECOND)
+    assert sample, "no frame arrived"
+    buffer = sample.get_buffer()
+    ok, info = buffer.map(Gst.MapFlags.READ)
+    assert ok, "couldn't read frame"
+    data = bytes(info.data)
+    buffer.unmap(info)
+    return data
+
+
+def pull_frame(sink):
+    """Mean-comparable pixel samples from the newest frame, as (r, g, b) tuples."""
+    data = pull_bytes(sink)
+    return [tuple(data[i:i + 3]) for i in range(0, len(data), 4 * 211)]
+
+
+def red_dot_pixels(sink, side="right"):
+    """Counts strongly red pixels in a top 100x100 corner: the record dot is on the right when mirrored."""
+    data = pull_bytes(sink)
+    left = 1180 if side == "right" else 0
+    pixels = (data[(y * 1280 + x) * 4:(y * 1280 + x) * 4 + 3] for y in range(100) for x in range(left, left + 100))
+    return sum(r > 150 and g < 90 and b < 90 for r, g, b in pixels)
+
+
+def mean(frame, channel=None):
+    values = [sum(p) / 3 if channel is None else p[channel] for p in frame]
+    return sum(values) / len(values)
+
+
+def difference(a, b):
+    return sum(abs(x - y) for p, q in zip(a, b) for x, y in zip(p, q)) / (3 * len(a))
+
+
+def listen(sink, seconds=0.3):
+    """Left-channel samples arriving after this call, for measuring a voice."""
+    while sink.emit("try-pull-sample", 0):
+        pass
+    samples = []
+    while len(samples) < seconds * 48000:
+        sample = sink.emit("try-pull-sample", 2 * Gst.SECOND)
+        assert sample, "no audio arrived"
+        buffer = sample.get_buffer()
+        ok, info = buffer.map(Gst.MapFlags.READ)
+        assert ok, "couldn't read audio"
+        samples += struct.unpack(f"<{len(info.data) // 4}f", bytes(info.data))[::2]
+        buffer.unmap(info)
+    return samples
+
+
+def tone_frequency(samples):
+    crossings = sum(1 for a, b in zip(samples, samples[1:]) if a < 0 <= b)
+    return crossings / (len(samples) / 48000)
+
+
+def peak(samples):
+    return max(abs(x) for x in samples)
+
+
+def check_voices():
+    """Synthetic tone only: no mic or virtual devices are touched."""
+    pipeline = Gst.parse_launch(
+        f"audiotestsrc name=tone is-live=true freq=440 volume=0.4 samplesperbuffer=480 ! {VOICE_CHAIN} "
+        "! appsink name=sink sync=false drop=true max-buffers=50"
+    )
+    tone, sink = pipeline.get_by_name("tone"), pipeline.get_by_name("sink")
+    attach_shifter(pipeline)
+    set_voice(pipeline, "Normal")
+    pipeline.set_state(Gst.State.PLAYING)
+
+    def voice_at(name, frequency=440):
+        tone.set_property("freq", float(frequency))
+        set_voice(pipeline, name)
+        time.sleep(0.7)
+        return listen(sink)
+
+    pitched = load_rubberband() is not None
+    if not pitched:
+        print("Rubber Band isn't installed: skipping the pitch voices")
+    for name, expected in (("Normal", 440), ("Deep", 330), ("Chipmunk", 704), ("Child", 748), ("Female", 660),
+                           ("Male", 352), ("Robot", 405), ("Demon", 273), ("Alien", 528), ("Ghost", 466),
+                           ("Ghostface", 343), ("Normal", 440)):
+        if not pitched and "pitch" in VOICES[name]:
+            continue
+        measured = tone_frequency(voice_at(name))
+        print(f"{name:14} {expected}Hz expected, measured {measured:.0f}Hz")
+        assert abs(measured - expected) < expected * 0.04, f"{name} is at the wrong pitch"
+
+    for frequency in (100, 1000, 6000):
+        normal, radio = peak(voice_at("Normal", frequency)), peak(voice_at("Walkie-Talkie", frequency))
+        print(f"Walkie-Talkie  {frequency}Hz: {radio:.3f} vs Normal {normal:.3f}")
+        if frequency == 1000:
+            assert radio > normal, "Walkie-Talkie lost the speech band"
+        else:
+            assert radio < normal * 0.25, "Walkie-Talkie isn't narrowing the sound"
+
+    tails = {}
+    for name in ("Normal", "Cave", "Ghost"):
+        voice_at(name)
+        tone.set_property("volume", 0.0)
+        time.sleep(0.35)
+        tails[name] = peak(listen(sink, 0.1))
+        tone.set_property("volume", 0.4)
+    print(f"Echo tail 0.35s after sound stops: Cave {tails['Cave']:.4f}, Ghost {tails['Ghost']:.4f}, Normal {tails['Normal']:.4f}")
+    assert min(tails["Cave"], tails["Ghost"]) > 0.01 > 0.002 > tails["Normal"], "Cave or Ghost doesn't echo, or Normal does"
+
+    message = pipeline.get_bus().pop_filtered(Gst.MessageType.ERROR)
+    pipeline.set_state(Gst.State.NULL)
+    assert not message, message.parse_error()[0].message if message else ""
+
+
+def resonance_centre(name):
+    """Where a voice-like sound's energy sits after a voice, in Hz, using the shifter directly."""
+    resonance = [(k, 1 / (1 + ((k * 120 - 700) / 150) ** 2)) for k in range(1, 30)]
+    source = [0.2 * sum(a * math.sin(2 * math.pi * k * 120 * i / 48000) for k, a in resonance) for i in range(48000)]
+    shifter = PitchShifter()
+    voice = VOICES[name]
+    shifter.want(voice.get("pitch", 1.0), voice.get("formant", voice.get("pitch", 1.0)))
+    output = b"".join(shifter.process(struct.pack("<480f", *source[i:i + 480])) for i in range(0, 47520, 480))
+    samples = struct.unpack(f"<{len(output) // 4}f", output)[-12000:]
+    # Measured on the shifted voice's own harmonics: a fixed grid misses them and skews the result.
+    f0 = 120 * voice.get("pitch", 1.0)
+    bands = []
+    for frequency in (f0 * k for k in range(1, int(3000 / f0))):
+        step = 2 * math.cos(2 * math.pi * frequency / 48000)
+        a = b = 0.0
+        for x in samples:
+            a, b = x + step * a - b, a
+        bands.append((frequency, a * a + b * b - step * a * b))
+    return sum(f * p for f, p in bands) / sum(p for _, p in bands)
+
+
+def check_formants():
+    if load_rubberband() is None:
+        return
+    chipmunk, female, male = (resonance_centre(name) for name in ("Chipmunk", "Female", "Male"))
+    print(f"Resonance: Chipmunk {chipmunk:.0f}Hz, Female {female:.0f}Hz, Male {male:.0f}Hz")
+    assert female < chipmunk * 0.85, "Female's resonance moved with its pitch, so it will sound like Chipmunk"
+    assert male < female * 0.9, "Male's resonance isn't lower than Female's"
+
+
+def check_red_barn():
+    pipeline = Gst.parse_launch(
+        "videotestsrc is-live=true pattern=smpte75 ! video/x-raw,format=I420,width=1280,height=720,framerate=30/1 "
+        f"! {FILTER_CHAIN} ! videoconvert ! video/x-raw,format=RGBA "
+        "! appsink name=sink sync=false drop=true max-buffers=1"
+    )
+    fx, sink = pipeline.get_by_name("fx"), pipeline.get_by_name("sink")
+    fx.set_property("fragment", SHADER)
+    set_look(fx, "Red Barn")
+    pipeline.set_state(Gst.State.PLAYING)
+    time.sleep(0.4)
+    first = pull_bytes(sink)
+    time.sleep(0.5)
+    second = pull_bytes(sink)
+    set_camera_flipped(pipeline, True)
+    time.sleep(0.3)
+    flipped = pull_bytes(sink)
+    pipeline.set_state(Gst.State.NULL)
+
+    def pixels(frame, left, right, top, bottom):
+        return [frame[(y * 1280 + x) * 4:(y * 1280 + x) * 4 + 3] for y in range(top, bottom, 3) for x in range(left, right, 3)]
+
+    def change(a, b):
+        return sum(abs(p - q) for x, y in zip(a, b) for p, q in zip(x, y)) / (3 * len(a))
+
+    door, opening = (20, 240, 100, 700), (300, 980, 150, 600)
+    wood = pixels(first, *door)
+    red = sum(p[0] for p in wood) / len(wood)
+    green = sum(p[1] for p in wood) / len(wood)
+    white = sum(min(p) > 130 for p in wood) / len(wood)
+    beam = pixels(first, 300, 980, 10, 50)
+    print(f"Red Barn: door red {red:.0f} vs green {green:.0f}, white trim {white:.0%}, beam red {sum(p[0] for p in beam) / len(beam):.0f}, "
+          f"door shimmer {change(wood, pixels(second, *door)):.2f}, dust movement {change(pixels(first, *opening), pixels(second, *opening)):.2f}")
+    assert red > green * 1.3, "Red Barn doors aren't red"
+    assert 0.08 < white < 0.6, "Red Barn doors have no white bracing"
+    assert sum(p[0] for p in beam) / len(beam) < 110, "Red Barn beam isn't at the top"
+    assert change(wood, pixels(second, *door)) < 0.5, "Red Barn wood shimmers"
+    assert change(pixels(first, *opening), pixels(second, *opening)) > 0.02, "Red Barn dust isn't moving"
+    assert first[(360 * 1280 + 500) * 4 + 1] > 2 * first[(360 * 1280 + 1000) * 4 + 1], "Red Barn lost the camera picture"
+    assert change(wood, pixels(flipped, *door)) < 0.5, "Flip camera moved the doors"
+    assert change(pixels(first, *opening), pixels(flipped, *opening)) > 10, "Flip camera didn't reach the picture"
+
+
+def check_picture_not_mirrored():
+    # The gradient self_test uses looks the same mirrored; these colour bars are bright on the left.
+    pipeline = Gst.parse_launch(
+        "videotestsrc is-live=true pattern=smpte75 ! video/x-raw,format=I420,width=1280,height=720,framerate=30/1 "
+        f"! {FILTER_CHAIN} ! videoconvert ! video/x-raw,format=RGBA "
+        "! appsink name=sink sync=false drop=true max-buffers=1"
+    )
+    fx, sink = pipeline.get_by_name("fx"), pipeline.get_by_name("sink")
+    fx.set_property("fragment", SHADER)
+    set_look(fx, "Clean")
+    pipeline.set_state(Gst.State.PLAYING)
+    time.sleep(0.4)
+    mirrored = pull_bytes(sink)
+    set_text_mirrored(pipeline, False)
+    time.sleep(0.3)
+    plain = pull_bytes(sink)
+    set_camera_flipped(pipeline, True)
+    time.sleep(0.3)
+    flipped = pull_bytes(sink)
+    pipeline.set_state(Gst.State.NULL)
+    row = 360 * 1280 * 4
+    assert flipped[row + 41] < 30 < 150 < flipped[row + 5041], "camera flip didn't mirror the picture"
+    assert mirrored[row + 41] > 150 > 30 > mirrored[row + 5041], "picture is mirrored"
+    changed = sum(abs(a - b) for a, b in zip(mirrored[::4 * 97], plain[::4 * 97])) / len(mirrored[::4 * 97])
+    print(f"mirrored vs plain picture difference={changed:.2f}")
+    assert changed < 1, "mirroring the text altered the picture"
+
+
+def self_test():
+    """Asserts on pixels: both failures this guards against raise no GStreamer error."""
+    # gradient is static and dark at the top: smpte has animated snow, which fakes moving grain.
+    pipeline = Gst.parse_launch(
+        "videotestsrc is-live=true pattern=gradient ! video/x-raw,format=I420,width=1280,height=720,framerate=30/1 "
+        f"! {FILTER_CHAIN} ! videoconvert ! video/x-raw,format=RGBA "
+        "! appsink name=sink sync=false drop=true max-buffers=1"
+    )
+    fx, sink = pipeline.get_by_name("fx"), pipeline.get_by_name("sink")
+    fx.set_property("fragment", SHADER)
+    set_look(fx, "Clean")
+    pipeline.set_state(Gst.State.PLAYING)
+
+    frames = {}
+    for name in LOOKS:
+        set_look(fx, name)
+        set_overlay(pipeline, name)
+        time.sleep(0.4)
+        dot = red_dot_pixels(sink)
+        # Red Barn's door is red where the dot would sit: check_red_barn covers that look.
+        assert name == "Red Barn" or (dot > 30) == (name in OVERLAYS), f"{name} record dot is wrong: {dot} red pixels"
+        frames[name] = pull_frame(sink)
+        time.sleep(0.15)
+        again = pull_frame(sink)
+        moved = difference(frames[name], again)
+        print(f"{name:13} brightness={mean(frames[name]):5.1f} "
+              f"vs clean={difference(frames[name], frames['Clean']):5.1f} frame-to-frame={moved:5.2f}")
+        assert mean(frames[name]) > 8, f"{name} is black"
+        if name in GRAINY_LOOKS:
+            assert moved > 1, f"{name} grain isn't moving"
+        elif name == "Clean":
+            assert moved < 0.5, "Clean is altering the image"
+
+    set_look(fx, "CCTV")
+    set_overlay(pipeline, "CCTV", blink=False)
+    time.sleep(0.2)
+    assert red_dot_pixels(sink) == 0, "record dot doesn't blink off"
+
+    set_overlay(pipeline, "CCTV")
+    set_text_mirrored(pipeline, False)
+    time.sleep(0.2)
+    assert red_dot_pixels(sink, "left") > 30 and red_dot_pixels(sink) == 0, "overlay didn't unmirror"
+
+    message = pipeline.get_bus().pop_filtered(Gst.MessageType.ERROR)
+    pipeline.set_state(Gst.State.NULL)
+    assert not message, error_hint(message) if message else ""
+
+    for name in LOOKS[1:]:
+        assert difference(frames[name], frames["Clean"]) > 3, f"{name} didn't change the image"
+    night = frames["Night Vision"]
+    assert mean(night, 1) > 3 * max(mean(night, 0), mean(night, 2)), "Night Vision isn't green"
+    silent = frames["Silent Film"]
+    assert mean(silent, 0) > mean(silent, 1) > mean(silent, 2), "Silent Film isn't sepia"
+    thermal = frames["Thermal"]
+    assert sum(abs(r - b) for r, _, b in thermal) / len(thermal) > 20, "Thermal has no heat colours"
+    blockbuster = frames["Blockbuster"]
+    assert mean(blockbuster[:len(blockbuster) // 20]) < 2, "Blockbuster has no black bars"
+    clean = frames["Clean"]
+    assert mean(clean[:len(clean) // 2]) < mean(clean[len(clean) // 2:]), "image is upside down"
+    check_picture_not_mirrored()
+    check_red_barn()
+    assert len(LOOKS) == len(VOICES), "Looks and voices should stay equal in number"
+    check_voices()
+    check_formants()
+    print("self-test passed")
+
+
+if __name__ == "__main__":
+    Gst.init(None)
+    if "--self-test" in sys.argv:
+        self_test()
+    else:
+        sys.exit(RedbarnStudio().run([sys.argv[0]]))
