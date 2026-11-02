@@ -39,11 +39,9 @@ jobs:
           grep -rl "DEFAULTLIB" pyvirtualcam --include=setup.py | xargs sed -i 's#/DEFAULTLIB:advapi32.lib#-ladvapi32#'
           pip install -q --break-system-packages --no-build-isolation ./pyvirtualcam
           python -c "import pyvirtualcam; print('pyvirtualcam', pyvirtualcam.__version__)"
-      - name: Self-test, server's default OpenGL
-        continue-on-error: true
+      - name: Self-test
+        # The server has no GPU, so Mesa's software renderer stands in. Mesa's opengl32.dll sits next to
+        # python.exe here; a packaged app must not ship it, or it would override users' graphics drivers.
+        env:
+          GALLIUM_DRIVER: llvmpipe
         run: python -u -X faulthandler redbarn-studio --self-test
-      - name: Self-test, Mesa software OpenGL
-        # The build server has no GPU; real PCs use their graphics driver.
-        run: |
-          cp "$(pacman -Ql mingw-w64-ucrt-x86_64-mesa | awk '/bin\/opengl32\.dll$/ {print $2}')" "$(dirname "$(which python)")/"
-          GALLIUM_DRIVER=llvmpipe python -u -X faulthandler redbarn-studio --self-test
