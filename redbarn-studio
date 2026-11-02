@@ -10,7 +10,6 @@
 """
 import ctypes
 import ctypes.util
-import fcntl
 import glob
 import math
 import os
@@ -27,7 +26,7 @@ APP_NAME = "Redbarn Studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
 MIC_NAME = "Redbarn Mic"
 MIC_NODE, OUTPUT_NODE = "redbarn_mic", "redbarn_output"
-RUBBERBAND_NAMES = ("librubberband.so.3", "librubberband.so.2")  # Fedora, then Ubuntu/Debian
+RUBBERBAND_NAMES = ("librubberband.so.3", "librubberband.so.2", "librubberband-3.dll")  # Fedora, Ubuntu/Debian, Windows
 VIDIOC_QUERYCAP = 0x80685600
 LOOPBACK_SETUP = 'sudo modprobe v4l2loopback exclusive_caps=1 card_label="Redbarn Camera"'
 GST_ELEMENTS = ("v4l2src", "v4l2sink", "jpegdec", "glupload", "glshader", "gldownload", "textoverlay", "videoflip",
@@ -70,6 +69,7 @@ def find_webcam():
 
 def video_devices():
     """(path, driver, name) for each video device, asked directly: labels and sysfs links vary between systems."""
+    import fcntl  # Linux only
     for path in sorted(glob.glob("/dev/video*")):
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
@@ -113,7 +113,7 @@ def requirements():
     results = []
     try:
         import gi
-        for namespace, version in (("Gtk", "4.0"), ("Adw", "1"), ("Gst", "1.0"), ("GstApp", "1.0")):
+        for namespace, version in (("Gtk", "4.0"), ("Adw", "1"), ("Gst", "1.0"), ("GstApp", "1.0"), ("GstGL", "1.0")):
             gi.require_version(namespace, version)
         from gi.repository import Adw, Gst, Gtk  # noqa: F401
         ui = True
@@ -226,8 +226,9 @@ try:
     gi.require_version("Gdk", "4.0")
     gi.require_version("Gst", "1.0")
     gi.require_version("GstApp", "1.0")
+    gi.require_version("GstGL", "1.0")
     gi.require_version("Gtk", "4.0")
-    from gi.repository import Adw, Gdk, GLib, Gst, GstApp, Gtk
+    from gi.repository import Adw, Gdk, GLib, Gst, GstApp, GstGL, Gtk
 except (ImportError, ValueError):
     if __name__ != "__main__":
         raise
@@ -276,8 +277,7 @@ OVERLAYS = {
 
 # One shader with a mode uniform: glshader ignores new fragment source while
 # playing, and restarting the pipeline would drop the camera from Discord.
-SHADER = """#version 110
-varying vec2 v_texcoord;
+SHADER = """varying vec2 v_texcoord;
 uniform sampler2D tex;
 uniform float time;
 uniform float mode;
@@ -500,6 +500,43 @@ void main() {
 }
 """
 
+# Written in GLSL 1.10 style; attach_shader adds the version line and shims each driver needs.
+VERTEX_SHADER = """attribute vec4 a_position;
+attribute vec2 a_texcoord;
+varying vec2 v_texcoord;
+void main() { gl_Position = a_position; v_texcoord = a_texcoord; }
+"""
+GL_VERTEX_SHADER, GL_FRAGMENT_SHADER = 0x8B31, 0x8B30
+
+
+def attach_shader(fx):
+    """Build the looks once the OpenGL context exists, with both shader stages on that context's GLSL version.
+
+    Drivers reject a vertex/fragment version mismatch (Windows core-profile drivers do), and glshader then
+    silently passes video through unfiltered, so the version can't be left to GStreamer's default vertex stage.
+    """
+    def build(element):
+        context = element.get_property("context")
+        api = context.get_gl_api()
+        if api & GstGL.GLAPI.GLES2:
+            version, profile, vertex_head, fragment_head = 100, GstGL.GLSLProfile.ES, "", "precision highp float;\n"
+        elif api & GstGL.GLAPI.OPENGL3:
+            version, profile = 150, GstGL.GLSLProfile.CORE
+            vertex_head = "#define attribute in\n#define varying out\n"
+            fragment_head = "#define varying in\n#define texture2D texture\nout vec4 frag_color;\n#define gl_FragColor frag_color\n"
+        else:
+            version, profile, vertex_head, fragment_head = 110, GstGL.GLSLProfile.NONE, "", ""
+        version = GstGL.GLSLVersion(version)
+        top = f"#version {GstGL.glsl_version_profile_to_string(version, profile)}\n"
+        shader = GstGL.GLShader.new(context)
+        for kind, head, body in ((GL_VERTEX_SHADER, vertex_head, VERTEX_SHADER), (GL_FRAGMENT_SHADER, fragment_head, SHADER)):
+            shader.compile_attach_stage(GstGL.GLSLStage.new_with_string(context, kind, version, profile, top + head + body))
+        shader.link()
+        return shader
+
+    fx.connect("create-shader", build)
+
+
 FILTER_CHAIN = (
     "videoconvert ! video/x-raw,format=RGBA ! videoflip name=camera_flip ! glupload ! glcolorconvert ! glshader name=fx "
     "! gldownload ! videoconvert ! video/x-raw,format=YUY2"
@@ -717,7 +754,7 @@ def build_camera_pipeline(cam, loopback):
         "! appsink name=preview sync=false drop=true max-buffers=1 emit-signals=true"
     )
     fx = pipeline.get_by_name("fx")
-    fx.set_property("fragment", SHADER)
+    attach_shader(fx)
     set_look(fx, LOOKS[0])
     return pipeline
 
@@ -1112,7 +1149,7 @@ def check_red_barn():
         "! appsink name=sink sync=false drop=true max-buffers=1"
     )
     fx, sink = pipeline.get_by_name("fx"), pipeline.get_by_name("sink")
-    fx.set_property("fragment", SHADER)
+    attach_shader(fx)
     set_look(fx, "Red Barn")
     pipeline.set_state(Gst.State.PLAYING)
     time.sleep(0.4)
@@ -1156,7 +1193,7 @@ def check_picture_not_mirrored():
         "! appsink name=sink sync=false drop=true max-buffers=1"
     )
     fx, sink = pipeline.get_by_name("fx"), pipeline.get_by_name("sink")
-    fx.set_property("fragment", SHADER)
+    attach_shader(fx)
     set_look(fx, "Clean")
     pipeline.set_state(Gst.State.PLAYING)
     time.sleep(0.4)
@@ -1185,7 +1222,7 @@ def self_test():
         "! appsink name=sink sync=false drop=true max-buffers=1"
     )
     fx, sink = pipeline.get_by_name("fx"), pipeline.get_by_name("sink")
-    fx.set_property("fragment", SHADER)
+    attach_shader(fx)
     set_look(fx, "Clean")
     pipeline.set_state(Gst.State.PLAYING)
 
