@@ -69,21 +69,27 @@ def windows_device(device_class, id_property, want=None):
     or else the default real one.
 
     Virtual devices are skipped by default, so the app never reads its own virtual camera or mic: that
-    would be a feedback loop.
+    would be a feedback loop. So are Windows's speaker-recording sources and its "Default ..." placeholders,
+    which can stand for one of those.
     """
     from gi.repository import Gst
     Gst.init(None)
     monitor = Gst.DeviceMonitor()
     monitor.add_filter(device_class, None)
     monitor.start()
-    devices = monitor.get_devices()
+    def loopback(d):
+        props = d.get_properties()
+        return bool(props and props.has_field("wasapi2.device.loopback") and props.get_value("wasapi2.device.loopback"))
+
+    devices = [d for d in monitor.get_devices() if not loopback(d)]
     monitor.stop()
     if want:
         wants = (want,) if isinstance(want, str) else want
         # VB-CABLE's 16-channel variant isn't the one Discord's "CABLE Output" mic carries.
         matches = [d for w in wants for d in devices if w in d.get_display_name() and "16 Ch" not in d.get_display_name()]
     else:
-        matches = [d for d in devices if not any(v in d.get_display_name() for v in ("CABLE", "OBS", "Virtual"))]
+        matches = [d for d in devices if not any(v in d.get_display_name() for v in ("CABLE", "OBS", "Virtual"))
+                   and not d.get_display_name().startswith("Default ")]
         matches.sort(key=lambda d: not (d.get_properties() and d.get_properties().has_field("device.default")
                                         and d.get_properties().get_value("device.default")))
     return matches[0].create_element(None).get_property(id_property) if matches else None

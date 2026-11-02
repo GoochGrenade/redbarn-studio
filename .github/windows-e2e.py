@@ -20,7 +20,10 @@ for device_class in ("Video/Source", "Audio/Source", "Audio/Sink"):
     monitor = Gst.DeviceMonitor()
     monitor.add_filter(device_class, None)
     monitor.start()
-    print(device_class, [d.get_display_name() for d in monitor.get_devices()])
+    for d in monitor.get_devices():
+        props = d.get_properties()
+        keys = {k: props.get_value(k) for k in ("device.default", "wasapi2.device.loopback") if props and props.has_field(k)}
+        print(f"  {device_class:12} {d.get_display_name()!r} {keys}")
     monitor.stop()
 app.report()
 failures = []
@@ -90,28 +93,47 @@ check(output is not None, "VB-CABLE playback side found")
 cable_out = app.windows_device("Audio/Source", "device", "CABLE Output")
 check(cable_out is not None, "VB-CABLE Output found")
 if output and cable_out:
+    def listen_cable(seconds=3):
+        reader = Gst.parse_launch("wasapi2src name=src low-latency=true ! audioconvert "
+                                  "! audio/x-raw,format=F32LE,channels=1,rate=48000 ! appsink name=a sync=false max-buffers=400")
+        reader.get_by_name("src").set_property("device", cable_out)
+        sink = reader.get_by_name("a")
+        reader.set_state(Gst.State.PLAYING)
+        samples = []
+        end = time.time() + seconds
+        while time.time() < end:
+            sample = sink.emit("try-pull-sample", Gst.SECOND // 2)
+            if sample:
+                buffer = sample.get_buffer()
+                data = buffer.extract_dup(0, buffer.get_size())
+                samples += struct.unpack(f"<{len(data) // 4}f", data)
+        message = reader.get_bus().pop_filtered(Gst.MessageType.ERROR)
+        reader.set_state(Gst.State.NULL)
+        tail = samples[len(samples) // 2:]
+        if message:
+            print("   reader error:", message.parse_error()[0].message)
+        return len(samples), (app.tone_frequency(tail) if tail else 0), (app.peak(tail) if tail else 0)
+
+    # Baseline without the app: a plain tone straight into VB-CABLE.
+    plain = Gst.parse_launch("audiotestsrc is-live=true freq=440 volume=0.4 ! audioconvert ! wasapi2sink name=out low-latency=true")
+    plain.get_by_name("out").set_property("device", output)
+    plain.set_state(Gst.State.PLAYING)
+    time.sleep(1)
+    count, frequency, level = listen_cable()
+    message = plain.get_bus().pop_filtered(Gst.MessageType.ERROR)
+    print(f"   plain tone through VB-CABLE: {count} samples, {frequency:.0f}Hz, peak {level:.2f}",
+          message.parse_error()[0].message if message else "")
+    plain.set_state(Gst.State.NULL)
+
     voice = app.build_voice_pipeline(None, output)
+    written = [0]
+    voice.get_by_name("voice_out").get_static_pad("sink").add_probe(
+        Gst.PadProbeType.BUFFER, lambda *_: (written.__setitem__(0, written[0] + 1), Gst.PadProbeReturn.OK)[1])
     app.set_voice(voice, "Deep")
     voice.set_state(Gst.State.PLAYING)
     time.sleep(1.5)
-    reader_text = ("wasapi2src name=src low-latency=true ! audioconvert ! audio/x-raw,format=F32LE,channels=1,rate=48000 "
-                   "! appsink name=a sync=false max-buffers=100 drop=false")
-    reader = Gst.parse_launch(reader_text)
-    reader.get_by_name("src").set_property("device", cable_out)
-    sink = reader.get_by_name("a")
-    reader.set_state(Gst.State.PLAYING)
-    samples = []
-    end = time.time() + 4
-    while time.time() < end and len(samples) < 48000:
-        sample = sink.emit("try-pull-sample", Gst.SECOND // 2)
-        if sample:
-            buffer = sample.get_buffer()
-            data = buffer.extract_dup(0, buffer.get_size())
-            samples += struct.unpack(f"<{len(data) // 4}f", data)
-    reader.set_state(Gst.State.NULL)
-    tail = samples[len(samples) // 2:]
-    frequency = app.tone_frequency(tail) if tail else 0
-    level = app.peak(tail) if tail else 0
+    count, frequency, level = listen_cable()
+    print(f"   buffers the app wrote to VB-CABLE: {written[0]}; read back {count} samples")
     check(abs(frequency - 330) < 15 and level > 0.05,
           f"CABLE Output carries the Deep voice: {frequency:.0f}Hz (expect 330), peak {level:.2f}")
     message = voice.get_bus().pop_filtered(Gst.MessageType.ERROR)
