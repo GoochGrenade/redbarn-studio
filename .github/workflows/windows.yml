@@ -31,8 +31,16 @@ jobs:
             mingw-w64-ucrt-x86_64-mesa
             mingw-w64-ucrt-x86_64-toolchain
             mingw-w64-ucrt-x86_64-cmake
-      - name: Try installing pyvirtualcam
-        continue-on-error: true
-        run: pip install --break-system-packages pyvirtualcam 2>&1 | tail -15
+            mingw-w64-ucrt-x86_64-pybind11
+            git
+      - name: Python starts
+        run: python -u -X faulthandler -c "import sys; print(sys.version)"
       - name: Probe
-        run: python .github/windows-probe.py
+        continue-on-error: true
+        run: python -u -X faulthandler .github/windows-probe.py
+      - name: Try building pyvirtualcam from source
+        continue-on-error: true
+        run: |
+          git clone -q --recursive --depth 1 https://github.com/letmaik/pyvirtualcam
+          pip install --break-system-packages --no-build-isolation ./pyvirtualcam 2>&1 | tail -25
+          python -c "import pyvirtualcam; print('PASS pyvirtualcam', pyvirtualcam.__version__)"
