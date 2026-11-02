@@ -17,12 +17,12 @@ jobs:
           msystem: UCRT64
           update: false
       - name: Install MSYS2 packages
-        # mirror.msys2.org has stalled for whole runs; try university mirrors first, and retry.
+        # mirror.msys2.org has stalled for whole runs; try a university mirror first, and retry.
         run: |
           for repo in mingw msys; do
             list=/etc/pacman.d/mirrorlist.$repo
             path='mingw/$repo'; [ $repo = msys ] && path='msys/$arch'
-            { for host in https://ftp.fau.de/msys2 https://mirrors.dotsrc.org/msys2; do echo "Server = $host/$path/"; done; cat $list; } > $list.new
+            { for host in https://mirrors.dotsrc.org/msys2; do echo "Server = $host/$path/"; done; cat $list; } > $list.new
             mv $list.new $list
           done
           for attempt in 1 2 3; do
