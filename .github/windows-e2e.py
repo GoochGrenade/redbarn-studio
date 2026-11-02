@@ -153,6 +153,11 @@ if output and cable_out:
     time.sleep(1.5)
     count, frequency, level = listen_cable()
     print(f"   buffers the app wrote to VB-CABLE: {written[0]}; read back {count} samples")
+    print("   voice pipeline state:", [s.value_nick if hasattr(s, "value_nick") else s for s in voice.get_state(0)[:3]],
+          "| sink caps:", voice.get_by_name("voice_out").get_static_pad("sink").get_current_caps())
+    bus = voice.get_bus()
+    while (m := bus.pop_filtered(Gst.MessageType.WARNING | Gst.MessageType.ERROR)):
+        print("   voice bus:", m.src.get_name(), (m.parse_warning() if m.type == Gst.MessageType.WARNING else m.parse_error())[0].message)
     check(abs(frequency - 330) < 15 and level > 0.05,
           f"CABLE Output carries the Deep voice: {frequency:.0f}Hz (expect 330), peak {level:.2f}")
     message = voice.get_bus().pop_filtered(Gst.MessageType.ERROR)
