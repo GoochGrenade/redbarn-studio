@@ -731,7 +731,12 @@ def attach_shifter(pipeline):
 
     def forward(sink, pull):
         buffer = sink.emit(pull).get_buffer()
-        output = shifter.process(buffer.extract_dup(0, buffer.get_size()))
+        data = buffer.extract_dup(0, buffer.get_size())
+        output = shifter.process(data)
+        # Rubber Band holds back its first block, and the pipeline won't start until audio reaches its
+        # final sink, so a pitch voice at startup would stall forever. Pass the preroll block through.
+        if not output and pull == "pull-preroll":
+            output = data
         if output:
             source.push_buffer(Gst.Buffer.new_wrapped(output))
         return Gst.FlowReturn.OK
@@ -1114,7 +1119,10 @@ class RedbarnStudio(Adw.Application):
         self.pipeline.set_state(Gst.State.NULL)
 
     def on_voice_error(self, _bus, message):
-        self.voice_off(f"Voice filters stopped: {message.parse_error()[0].message}. The camera is unaffected.")
+        # Windows blocks microphones for desktop apps when this privacy setting is off.
+        hint = (" In Windows Settings, open Privacy & security > Microphone and turn on "
+                "\"Let desktop apps access your microphone\"." if WINDOWS and message.src.get_name() == "mic" else "")
+        self.voice_off(f"Voice filters stopped: {message.parse_error()[0].message}.{hint} The camera is unaffected.")
         self.voice_pipeline.set_state(Gst.State.NULL)
         self.voice_pipeline = None
 
@@ -1194,7 +1202,7 @@ def check_voices():
     )
     tone, sink = pipeline.get_by_name("tone"), pipeline.get_by_name("sink")
     attach_shifter(pipeline)
-    set_voice(pipeline, "Normal")
+    set_voice(pipeline, "Deep")  # start on a pitch voice: that once stalled the pipeline at startup
     pipeline.set_state(Gst.State.PLAYING)
 
     def voice_at(name, frequency=440):
