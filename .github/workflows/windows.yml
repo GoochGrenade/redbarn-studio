@@ -53,6 +53,12 @@ jobs:
         run: |
           Set-Service audiosrv -StartupType Automatic
           Start-Service audiosrv
+          # Windows privacy setting "Let desktop apps access your microphone"; often off on servers.
+          foreach ($k in "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone",
+                         "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone") {
+            New-Item -Path $k -Force | Out-Null
+            Set-ItemProperty -Path $k -Name Value -Value Allow
+          }
           choco install obs-studio -y --no-progress | Select-Object -Last 3
           Invoke-WebRequest https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip -OutFile cable.zip
           Expand-Archive cable.zip cable

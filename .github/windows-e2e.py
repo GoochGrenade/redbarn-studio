@@ -114,16 +114,35 @@ if output and cable_out:
             print("   reader error:", message.parse_error()[0].message)
         return len(samples), (app.tone_frequency(tail) if tail else 0), (app.peak(tail) if tail else 0)
 
-    # Baseline without the app: a plain tone straight into VB-CABLE.
-    plain = Gst.parse_launch("audiotestsrc is-live=true freq=440 volume=0.4 ! audioconvert ! wasapi2sink name=out low-latency=true")
-    plain.get_by_name("out").set_property("device", output)
-    plain.set_state(Gst.State.PLAYING)
-    time.sleep(1)
-    count, frequency, level = listen_cable()
-    message = plain.get_bus().pop_filtered(Gst.MessageType.ERROR)
-    print(f"   plain tone through VB-CABLE: {count} samples, {frequency:.0f}Hz, peak {level:.2f}",
-          message.parse_error()[0].message if message else "")
-    plain.set_state(Gst.State.NULL)
+    # Baselines without the app: a plain tone straight into VB-CABLE, through each Windows audio option.
+    for sink_text, source_text in (("wasapi2sink name=out low-latency=true", "wasapi2src name=src low-latency=true"),
+                                   ("wasapi2sink name=out", "wasapi2src name=src"),
+                                   ("wasapisink name=out", "wasapisrc name=src")):
+        plain = Gst.parse_launch(f"audiotestsrc is-live=true freq=440 volume=0.4 ! audioconvert ! {sink_text}")
+        out_device = output if "wasapi2" in sink_text else app.windows_device("Audio/Sink", "device", app.CABLE_INPUT)
+        plain.get_by_name("out").set_property("device", out_device)
+        state = plain.set_state(Gst.State.PLAYING)
+        time.sleep(1)
+        reader = Gst.parse_launch(f"{source_text} ! audioconvert ! audio/x-raw,format=F32LE,channels=1,rate=48000 "
+                                  "! appsink name=a sync=false max-buffers=400")
+        reader.get_by_name("src").set_property("device", cable_out if "wasapi2" in source_text
+                                               else app.windows_device("Audio/Source", "device", "CABLE Output"))
+        sink = reader.get_by_name("a")
+        reader.set_state(Gst.State.PLAYING)
+        samples = []
+        end = time.time() + 2.5
+        while time.time() < end:
+            sample = sink.emit("try-pull-sample", Gst.SECOND // 2)
+            if sample:
+                data = sample.get_buffer().extract_dup(0, sample.get_buffer().get_size())
+                samples += struct.unpack(f"<{len(data) // 4}f", data)
+        errors = [m.parse_error()[0].message for m in (plain.get_bus().pop_filtered(Gst.MessageType.ERROR),
+                                                        reader.get_bus().pop_filtered(Gst.MessageType.ERROR)) if m]
+        tail = samples[len(samples) // 2:]
+        print(f"   plain tone, {sink_text.split()[0]} {'low-latency' if 'low' in sink_text else ''}: start {state.value_nick}, "
+              f"{len(samples)} samples, {app.tone_frequency(tail) if tail else 0:.0f}Hz, peak {app.peak(tail) if tail else 0:.2f} {errors}")
+        reader.set_state(Gst.State.NULL)
+        plain.set_state(Gst.State.NULL)
 
     voice = app.build_voice_pipeline(None, output)
     written = [0]
