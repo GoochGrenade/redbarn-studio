@@ -22,6 +22,8 @@ import time
 from datetime import datetime
 
 WINDOWS = sys.platform == "win32"
+if WINDOWS and sys.stdout:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the console's default code page can't print ✓
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
@@ -33,6 +35,8 @@ WINDOWS_HELP = {
     "obs": "Install OBS Studio from https://obsproject.com. You don't need to open it; it provides the virtual camera.",
     "cable": "Install VB-CABLE from https://vb-audio.com/Cable/, then restart Windows. It provides the virtual mic.",
 }
+# VB-CABLE's playback side is "CABLE Input" on most PCs but can be named "Speakers (VB-Audio Virtual Cable)".
+CABLE_INPUT = ("CABLE Input", "VB-Audio Virtual Cable")
 LOOPBACK_SETUP = 'sudo modprobe v4l2loopback exclusive_caps=1 card_label="Redbarn Camera"'
 GST_ELEMENTS = (*(("mfvideosrc", "decodebin", "wasapi2src", "wasapi2sink") if WINDOWS else ("v4l2src", "v4l2sink", "pulsesrc", "pulsesink")), "jpegdec", "glupload", "glshader", "gldownload", "textoverlay", "videoflip",
                 "appsrc", "appsink", "audiocheblimit", "audioecho", "audioamplify", "freeverb")
@@ -61,7 +65,8 @@ def pactl(*args):
 
 
 def windows_device(device_class, id_property, want=None):
-    """ID of a Windows device: the one whose name contains `want`, or else the default real one.
+    """ID of a Windows device: the first whose name contains `want` (a name or names, in order of preference),
+    or else the default real one.
 
     Virtual devices are skipped by default, so the app never reads its own virtual camera or mic: that
     would be a feedback loop.
@@ -74,7 +79,9 @@ def windows_device(device_class, id_property, want=None):
     devices = monitor.get_devices()
     monitor.stop()
     if want:
-        matches = [d for d in devices if want in d.get_display_name()]
+        wants = (want,) if isinstance(want, str) else want
+        # VB-CABLE's 16-channel variant isn't the one Discord's "CABLE Output" mic carries.
+        matches = [d for w in wants for d in devices if w in d.get_display_name() and "16 Ch" not in d.get_display_name()]
     else:
         matches = [d for d in devices if not any(v in d.get_display_name() for v in ("CABLE", "OBS", "Virtual"))]
         matches.sort(key=lambda d: not (d.get_properties() and d.get_properties().has_field("device.default")
@@ -172,7 +179,7 @@ def requirements():
         if ui:
             results.append((obs_camera_ready(), "OBS Virtual Camera", "Discord can't see your filtered camera", "obs"))
             results.append((find_webcam() is not None, "Webcam", "there's nothing to filter. Plug one in", None))
-            results.append((windows_device("Audio/Sink", "device", "CABLE Input") is not None, "VB-CABLE virtual mic",
+            results.append((windows_device("Audio/Sink", "device", CABLE_INPUT) is not None, "VB-CABLE virtual mic",
                             "voice filters are off", "cable"))
             results.append((find_mic() is not None, "Microphone", "voice filters are off", None))
         results.append((load_rubberband() is not None, "Rubber Band", "the 7 voices that change pitch sound like Normal", None))
@@ -778,7 +785,7 @@ def die_with_parent():
 def start_virtual_mic():
     """(helper to stop on exit, device the voice is written to), or (None, None) if there's no virtual mic."""
     if WINDOWS:
-        return None, windows_device("Audio/Sink", "device", "CABLE Input")  # VB-CABLE, installed by the user
+        return None, windows_device("Audio/Sink", "device", CABLE_INPUT)  # VB-CABLE, installed by the user
     # pw-loopback, not pipewiresink mode=provide: that makes a mic that lists fine but carries no audio.
     process = subprocess.Popen([
         "pw-loopback", "--name=redbarn",

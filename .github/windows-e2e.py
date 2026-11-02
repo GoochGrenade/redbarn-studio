@@ -15,6 +15,12 @@ app = importlib.util.module_from_spec(spec)
 loader.exec_module(app)
 Gst = app.Gst
 Gst.init(None)
+for device_class in ("Video/Source", "Audio/Source", "Audio/Sink"):
+    monitor = Gst.DeviceMonitor()
+    monitor.add_filter(device_class, None)
+    monitor.start()
+    print(device_class, [d.get_display_name() for d in monitor.get_devices()])
+    monitor.stop()
 app.report()
 failures = []
 
@@ -79,7 +85,7 @@ if camera:
 # --- Voice: test tone -> Deep -> VB-CABLE
 app.MIC_SOURCE = "audiotestsrc name=mic is-live=true freq=440 volume=0.4 samplesperbuffer=480"
 _, output = app.start_virtual_mic()
-check(output is not None, "VB-CABLE Input found")
+check(output is not None, "VB-CABLE playback side found")
 cable_out = app.windows_device("Audio/Source", "device", "CABLE Output")
 check(cable_out is not None, "VB-CABLE Output found")
 if output and cable_out:
