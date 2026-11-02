@@ -6,6 +6,7 @@ and VB-CABLE, then are read back where Discord would read them. Exits non-zero i
 import importlib.machinery
 import importlib.util
 import struct
+import subprocess
 import sys
 import time
 
@@ -69,16 +70,16 @@ if camera:
     message = camera.get_bus().pop_filtered(Gst.MessageType.ERROR)
     check(message is None, "camera pipeline runs" + (f": {message.parse_error()[0].message}" if message else ""))
     check(sent[0] > 30, f"frames sent to OBS Virtual Camera in 4s: {sent[0]}")
-    if Gst.ElementFactory.find("dshowvideosrc"):
-        frame = read('dshowvideosrc device-name="OBS Virtual Camera" ! videoconvert ! video/x-raw,format=RGBA ! '
-                     "appsink name=a sync=false drop=true max-buffers=1")
-        if frame:
-            rgb = [sum(frame[i::4 * 97]) / (len(frame) / (4 * 97)) for i in range(3)]
-            check(rgb[1] > 2 * max(rgb[0], rgb[2]), f"OBS Virtual Camera shows Night Vision (green): RGB {[round(v) for v in rgb]}")
-        else:
-            check(False, "read frames back from OBS Virtual Camera")
+    # Read one frame back the way a DirectShow app like Discord would see the camera.
+    grab = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "dshow", "-i", "video=OBS Virtual Camera",
+                           "-frames:v", "1", "-s", "160x90", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                          capture_output=True, timeout=30)
+    frame = grab.stdout
+    if len(frame) == 160 * 90 * 3:
+        rgb = [sum(frame[i::3]) / (160 * 90) for i in range(3)]
+        check(rgb[1] > 2 * max(rgb[0], rgb[2]), f"OBS Virtual Camera shows Night Vision (green): RGB {[round(v) for v in rgb]}")
     else:
-        print("SKIP reading OBS Virtual Camera back: no DirectShow source in this GStreamer")
+        check(False, f"read a frame back from OBS Virtual Camera: {grab.stderr.decode(errors='replace')[-300:]}")
     camera.set_state(Gst.State.NULL)
     camera.virtual_camera.close()
 

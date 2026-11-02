@@ -31,6 +31,7 @@ jobs:
             mingw-w64-ucrt-x86_64-mesa
             mingw-w64-ucrt-x86_64-toolchain
             mingw-w64-ucrt-x86_64-pybind11
+            mingw-w64-ucrt-x86_64-ffmpeg
             git
       - name: Build pyvirtualcam
         # Its setup.py passes an MSVC-only linker flag; MinGW needs -ladvapi32 instead.
@@ -53,9 +54,6 @@ jobs:
           Set-Service audiosrv -StartupType Automatic
           Start-Service audiosrv
           choco install obs-studio -y --no-progress | Select-Object -Last 3
-          $dlls = Get-ChildItem "C:\Program Files", "C:\Program Files (x86)", "C:\ProgramData\chocolatey\lib" -Recurse -Filter "obs-virtualcam-module64.dll" -ErrorAction SilentlyContinue
-          $dlls | ForEach-Object { Write-Output "found $($_.FullName)"; regsvr32 /s $_.FullName }
-          if (-not $dlls) { Write-Output "OBS virtual camera module not found"; Get-ChildItem "C:\Program Files\obs-studio" -Depth 1 -ErrorAction SilentlyContinue | Select-Object -First 15 FullName }
           Invoke-WebRequest https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip -OutFile cable.zip
           Expand-Archive cable.zip cable
           $p = Start-Process cable\VBCABLE_Setup_x64.exe -ArgumentList '-i','-h' -PassThru
