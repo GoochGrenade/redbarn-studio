@@ -21,16 +21,21 @@ import sys
 import time
 from datetime import datetime
 
+WINDOWS = sys.platform == "win32"
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
-MIC_NAME = "Redbarn Mic"
+MIC_NAME = "CABLE Output" if WINDOWS else "Redbarn Mic"  # what to pick in Discord
 MIC_NODE, OUTPUT_NODE = "redbarn_mic", "redbarn_output"
 RUBBERBAND_NAMES = ("librubberband.so.3", "librubberband.so.2", "librubberband-3.dll")  # Fedora, Ubuntu/Debian, Windows
 VIDIOC_QUERYCAP = 0x80685600
+WINDOWS_HELP = {
+    "obs": "Install OBS Studio from https://obsproject.com. You don't need to open it; it provides the virtual camera.",
+    "cable": "Install VB-CABLE from https://vb-audio.com/Cable/, then restart Windows. It provides the virtual mic.",
+}
 LOOPBACK_SETUP = 'sudo modprobe v4l2loopback exclusive_caps=1 card_label="Redbarn Camera"'
-GST_ELEMENTS = ("v4l2src", "v4l2sink", "jpegdec", "glupload", "glshader", "gldownload", "textoverlay", "videoflip",
-                "pulsesrc", "pulsesink", "appsrc", "appsink", "audiocheblimit", "audioecho", "audioamplify", "freeverb")
+GST_ELEMENTS = (*(("mfvideosrc", "decodebin", "wasapi2src", "wasapi2sink") if WINDOWS else ("v4l2src", "v4l2sink", "pulsesrc", "pulsesink")), "jpegdec", "glupload", "glshader", "gldownload", "textoverlay", "videoflip",
+                "appsrc", "appsink", "audiocheblimit", "audioecho", "audioamplify", "freeverb")
 PACKAGES = {  # (Fedora, Ubuntu/Debian)
     "ui": ("python3-gobject gtk4 libadwaita", "python3-gi gir1.2-gtk-4.0 gir1.2-adw-1"),
     "gst": ("gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free",
@@ -55,16 +60,52 @@ def pactl(*args):
     return subprocess.run(["pactl", *args], capture_output=True, text=True, timeout=5).stdout.strip()
 
 
+def windows_device(device_class, id_property, want=None):
+    """ID of a Windows device: the one whose name contains `want`, or else the default real one.
+
+    Virtual devices are skipped by default, so the app never reads its own virtual camera or mic: that
+    would be a feedback loop.
+    """
+    from gi.repository import Gst
+    Gst.init(None)
+    monitor = Gst.DeviceMonitor()
+    monitor.add_filter(device_class, None)
+    monitor.start()
+    devices = monitor.get_devices()
+    monitor.stop()
+    if want:
+        matches = [d for d in devices if want in d.get_display_name()]
+    else:
+        matches = [d for d in devices if not any(v in d.get_display_name() for v in ("CABLE", "OBS", "Virtual"))]
+        matches.sort(key=lambda d: not (d.get_properties() and d.get_properties().has_field("device.default")
+                                        and d.get_properties().get_value("device.default")))
+    return matches[0].create_element(None).get_property(id_property) if matches else None
+
+
 def find_mic():
+    if WINDOWS:
+        return windows_device("Audio/Source", "device")
     # Never read our own virtual mic: that would be a feedback loop.
     mic = pactl("get-default-source")
     return mic if mic and mic not in (MIC_NODE, f"{OUTPUT_NODE}.monitor") else None
 
 
 def find_webcam():
+    if WINDOWS:
+        return windows_device("Video/Source", "device-path")
     # shortcut: takes the first webcam, add a picker if a second one is ever attached
     cams = sorted(glob.glob("/dev/v4l/by-id/*video-index0"))
     return cams[0] if cams else None
+
+
+def obs_camera_ready():
+    """Windows: can we open OBS's virtual camera? Fails if OBS isn't installed or its own camera is on."""
+    try:
+        import pyvirtualcam
+        with pyvirtualcam.Camera(width=320, height=180, fps=30, backend="obs"):
+            return True
+    except Exception:
+        return False
 
 
 def video_devices():
@@ -87,7 +128,9 @@ def video_devices():
 
 
 def find_loopback(devices=None):
-    """The first v4l2loopback device as (path, name), whatever it's labelled."""
+    """The first v4l2loopback device as (path, name), whatever it's labelled. Windows always uses OBS's."""
+    if WINDOWS:
+        return "obs", "OBS Virtual Camera"
     for path, driver, name in video_devices() if devices is None else devices:
         if driver == "v4l2 loopback":
             return path, name
@@ -125,6 +168,15 @@ def requirements():
         missing = [name for name in GST_ELEMENTS if not Gst.ElementFactory.find(name)]
         results.append((not missing, "GStreamer plugins" + (f" (missing: {', '.join(missing)})" if missing else ""),
                         "camera or voice filters can't run", "gst"))
+    if WINDOWS:
+        if ui:
+            results.append((obs_camera_ready(), "OBS Virtual Camera", "Discord can't see your filtered camera", "obs"))
+            results.append((find_webcam() is not None, "Webcam", "there's nothing to filter. Plug one in", None))
+            results.append((windows_device("Audio/Sink", "device", "CABLE Input") is not None, "VB-CABLE virtual mic",
+                            "voice filters are off", "cable"))
+            results.append((find_mic() is not None, "Microphone", "voice filters are off", None))
+        results.append((load_rubberband() is not None, "Rubber Band", "the 7 voices that change pitch sound like Normal", None))
+        return results
     loopback = find_loopback()
     results.append((loopback is not None, "Virtual camera" + (f" ({loopback[1]})" if loopback else ""),
                     f"Discord can't see your filtered camera. Load it with:  {LOOPBACK_SETUP}", "loopback"))
@@ -149,7 +201,9 @@ def report():
         print(f"  {'✓' if ok else '✗'} {what}")
         if not ok:
             print(f"      Without it {effect}.")
-            if package:
+            if package and WINDOWS:
+                print(f"      {WINDOWS_HELP[package]}")
+            elif package:
                 fedora, debian = PACKAGES[package]
                 print(f"      Fedora: sudo dnf install {fedora}\n      Ubuntu/Debian: sudo apt install {debian}")
     print("\nEverything's ready." if all(ok for ok, *_ in results) else "\nInstall what's marked ✗, then run this again.")
@@ -211,6 +265,8 @@ def uninstall(home=None):
     print(f"Removed {APP_NAME} from your app menu.")
 
 
+if __name__ == "__main__" and WINDOWS and sys.argv[1:2] in (["--install"], ["--uninstall"]):
+    sys.exit(f"On Windows, open {APP_NAME} from the folder you unzipped; there's nothing to install.")
 if __name__ == "__main__" and sys.argv[1:2] in (["--install"], ["--uninstall"], ["--check"]):
     {"--install": install, "--uninstall": uninstall, "--check": report}[sys.argv[1]]()
     sys.exit(0)
@@ -544,11 +600,11 @@ FILTER_CHAIN = (
     # Flipped either side of the text so only the text mirrors, never the picture.
     ' ! videoflip name=flip_in video-direction=horiz'
     ' ! textoverlay name=rec text=● color=0xFFFF2020 silent=true valignment=top halignment=left'
-    ' font-desc="Liberation Mono Bold 15" xpad=30 ypad=24'
+    ' font-desc="Liberation Mono,Consolas,monospace Bold 15" xpad=30 ypad=24'
     ' ! textoverlay name=info silent=true valignment=top halignment=left'
-    ' font-desc="Liberation Mono Bold 15" xpad=60 ypad=24'
+    ' font-desc="Liberation Mono,Consolas,monospace Bold 15" xpad=60 ypad=24'
     ' ! textoverlay name=stamp silent=true valignment=bottom halignment=left line-alignment=left'
-    ' font-desc="Liberation Mono Bold 15" xpad=30 ypad=24'
+    ' font-desc="Liberation Mono,Consolas,monospace Bold 15" xpad=30 ypad=24'
     ' ! videoflip name=flip_out video-direction=horiz'
 )
 
@@ -584,6 +640,16 @@ VOICES = {
 }
 RUBBERBAND_MISSING = "This voice needs the Rubber Band library, so it sounds like Normal. Run redbarn-studio --check."
 MIC_LOST = f"No sound is reaching {APP_NAME} from your mic. Check it's plugged in."
+# Device IDs are set as properties after parsing: Windows paths contain characters the parser would mangle.
+if WINDOWS:
+    WEBCAM_SOURCE, WEBCAM_DEVICE = ("mfvideosrc name=cam ! decodebin ! videoconvert ! videoscale "
+                                    "! video/x-raw,width=1280,height=720 ! videorate ! video/x-raw,framerate=30/1"), "device-path"
+    MIC_SOURCE = "wasapi2src name=mic low-latency=true"
+    VOICE_SINK = "wasapi2sink name=voice_out low-latency=true sync=false"
+else:
+    WEBCAM_SOURCE, WEBCAM_DEVICE = "v4l2src name=cam ! image/jpeg,width=1280,height=720,framerate=30/1 ! jpegdec", "device"
+    MIC_SOURCE = "pulsesrc name=mic buffer-time=40000 latency-time=10000"
+    VOICE_SINK = "pulsesink name=voice_out buffer-time=40000 latency-time=10000 sync=false"
 # Separate process: a playback fault must never reach what Discord receives.
 MONITOR_CMD = ["pw-loopback", "--name=redbarn-monitor", f"--capture={MIC_NODE}"]
 MIC_PROPS = "node.dont-fallback=true priority.session=1 priority.driver=1 audio.position=[FL FR]"
@@ -677,12 +743,32 @@ def set_voice(pipeline, name):
     pipeline.get_by_name("reverb").set_property("level", voice.get("reverb", 0.0))
 
 
-def stop_process(process):
-    process.terminate()
+def stop(handle):
+    """Stop a helper: a process on Linux, a GStreamer pipeline on Windows."""
+    if not isinstance(handle, subprocess.Popen):
+        handle.set_state(Gst.State.NULL)
+        return
+    handle.terminate()
     try:
-        process.wait(2)
+        handle.wait(2)
     except subprocess.TimeoutExpired:
-        process.kill()
+        handle.kill()
+
+
+def running(handle):
+    if isinstance(handle, subprocess.Popen):
+        return handle.poll() is None
+    return handle.get_bus().pop_filtered(Gst.MessageType.ERROR) is None
+
+
+def start_monitor():
+    """Play the virtual mic to the speakers, kept apart from what Discord receives."""
+    if not WINDOWS:
+        return subprocess.Popen(MONITOR_CMD, preexec_fn=die_with_parent)
+    pipeline = Gst.parse_launch("wasapi2src name=src low-latency=true ! audioconvert ! wasapi2sink low-latency=true sync=false")
+    pipeline.get_by_name("src").set_property("device", windows_device("Audio/Source", "device", "CABLE Output"))
+    pipeline.set_state(Gst.State.PLAYING)
+    return pipeline
 
 
 def die_with_parent():
@@ -690,6 +776,9 @@ def die_with_parent():
 
 
 def start_virtual_mic():
+    """(helper to stop on exit, device the voice is written to), or (None, None) if there's no virtual mic."""
+    if WINDOWS:
+        return None, windows_device("Audio/Sink", "device", "CABLE Input")  # VB-CABLE, installed by the user
     # pw-loopback, not pipewiresink mode=provide: that makes a mic that lists fine but carries no audio.
     process = subprocess.Popen([
         "pw-loopback", "--name=redbarn",
@@ -698,17 +787,17 @@ def start_virtual_mic():
     ], preexec_fn=die_with_parent)
     for _ in range(30):
         if OUTPUT_NODE in pactl("list", "short", "sinks"):
-            return process
+            return process, OUTPUT_NODE
         time.sleep(0.1)
     process.terminate()
-    return None
+    return None, None
 
 
-def build_voice_pipeline(mic):
-    pipeline = Gst.parse_launch(
-        f'pulsesrc name=mic device="{mic}" buffer-time=40000 latency-time=10000 ! {VOICE_CHAIN} '
-        f"! pulsesink name=voice_out device={OUTPUT_NODE} buffer-time=40000 latency-time=10000 sync=false"
-    )
+def build_voice_pipeline(mic, output):
+    pipeline = Gst.parse_launch(f"{MIC_SOURCE} ! {VOICE_CHAIN} ! {VOICE_SINK}")
+    if mic:
+        pipeline.get_by_name("mic").set_property("device", mic)
+    pipeline.get_by_name("voice_out").set_property("device", output)
     attach_shifter(pipeline)
     set_voice(pipeline, "Normal")
     return pipeline
@@ -743,20 +832,40 @@ def set_camera_flipped(pipeline, flipped):
 
 
 def build_camera_pipeline(cam, loopback):
+    output = ("t. ! queue ! videoconvert ! video/x-raw,format=RGB ! appsink name=out emit-signals=true sync=false drop=true max-buffers=2 "
+              if WINDOWS else f"t. ! queue ! v4l2sink name=out device={loopback} sync=false ")
     pipeline = Gst.parse_launch(
-        f"v4l2src name=cam device={cam} ! image/jpeg,width=1280,height=720,framerate=30/1 "
-        f"! jpegdec ! {FILTER_CHAIN} ! tee name=t "
-        f"t. ! queue ! v4l2sink name=out device={loopback} sync=false "
+        f"{WEBCAM_SOURCE} ! {FILTER_CHAIN} ! tee name=t "
+        f"{output}"
         # appsink, not gtk4paintablesink: that shares GTK's Wayland GL context with
         # glshader, which brings back the blank-frame path GST_GL_WINDOW=x11 avoids.
         "t. ! queue leaky=downstream max-size-buffers=2 ! videoscale ! videoconvert "
         f"! video/x-raw,format=RGBA,width={PREVIEW_WIDTH},height={PREVIEW_HEIGHT} "
         "! appsink name=preview sync=false drop=true max-buffers=1 emit-signals=true"
     )
+    if cam:
+        pipeline.get_by_name("cam").set_property(WEBCAM_DEVICE, cam)
+    if WINDOWS:
+        attach_virtual_camera(pipeline)
     fx = pipeline.get_by_name("fx")
     attach_shader(fx)
     set_look(fx, LOOKS[0])
     return pipeline
+
+
+def attach_virtual_camera(pipeline):
+    """Windows: send each finished frame to OBS's virtual camera. Raises if OBS isn't installed or is using it."""
+    import numpy
+    import pyvirtualcam
+    camera = pipeline.virtual_camera = pyvirtualcam.Camera(width=1280, height=720, fps=30,
+                                                           fmt=pyvirtualcam.PixelFormat.RGB, backend="obs")
+
+    def send(sink):
+        buffer = sink.emit("pull-sample").get_buffer()
+        camera.send(numpy.frombuffer(buffer.extract_dup(0, buffer.get_size()), numpy.uint8).reshape(720, 1280, 3))
+        return Gst.FlowReturn.OK
+
+    pipeline.get_by_name("out").connect("new-sample", send)
 
 
 def error_hint(message):
@@ -878,6 +987,9 @@ class RedbarnStudio(Adw.Application):
         except GLib.Error as e:
             self.camera_off(f"Couldn't set up video: {e.message}")
             return
+        except RuntimeError as e:  # Windows: OBS's virtual camera is missing or busy
+            self.camera_off(f"Couldn't start the virtual camera: {e} {WINDOWS_HELP['obs']}")
+            return
         self.pipeline.get_by_name("preview").connect("new-sample", self.on_preview)
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
@@ -893,11 +1005,12 @@ class RedbarnStudio(Adw.Application):
             if not mic:
                 self.voice_off("No microphone found, so voice filters are off.")
                 return
-            self.virtual_mic = start_virtual_mic()
-            if not self.virtual_mic:
-                self.voice_off("Couldn't create the virtual mic, so voice filters are off.")
+            self.virtual_mic, output = start_virtual_mic()
+            if not output:
+                help_text = f" {WINDOWS_HELP['cable']}" if WINDOWS else ""
+                self.voice_off(f"Couldn't create the virtual mic, so voice filters are off.{help_text}")
                 return
-            self.voice_pipeline = build_voice_pipeline(mic)
+            self.voice_pipeline = build_voice_pipeline(mic, output)
         except (GLib.Error, OSError, subprocess.SubprocessError) as e:
             self.voice_off(f"Voice filters are off: {e}")
             return
@@ -918,7 +1031,7 @@ class RedbarnStudio(Adw.Application):
         # A missing mic raises no error: pulsesrc just waits, and Discord would get silence.
         if not self.voice_pipeline:
             return False
-        if self.monitor_process and self.monitor_process.poll() is not None:
+        if self.monitor_process and not running(self.monitor_process):
             self.monitor.set_active(False)
         voice = VOICES[list(VOICES)[self.voice_menu.get_selected()]]
         if time.monotonic() - self.last_mic_audio > 2:
@@ -971,9 +1084,9 @@ class RedbarnStudio(Adw.Application):
 
     def on_monitor(self, row, _param):
         if row.get_active():
-            self.monitor_process = subprocess.Popen(MONITOR_CMD, preexec_fn=die_with_parent)
+            self.monitor_process = start_monitor()
         elif self.monitor_process:
-            stop_process(self.monitor_process)
+            stop(self.monitor_process)
             self.monitor_process = None
 
     def on_dark(self, row, _param):
@@ -992,12 +1105,11 @@ class RedbarnStudio(Adw.Application):
         self.voice_pipeline = None
 
     def on_close(self, _window):
-        for pipeline in (self.pipeline, self.voice_pipeline):
-            if pipeline:
-                pipeline.set_state(Gst.State.NULL)
-        for process in (self.monitor_process, self.virtual_mic):
-            if process:
-                stop_process(process)
+        for handle in (self.pipeline, self.voice_pipeline, self.monitor_process, self.virtual_mic):
+            if handle:
+                stop(handle)
+        if getattr(self.pipeline, "virtual_camera", None):
+            self.pipeline.virtual_camera.close()
         return False
 
 

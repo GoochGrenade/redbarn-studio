@@ -45,3 +45,22 @@ jobs:
         env:
           GALLIUM_DRIVER: llvmpipe
         run: python -u -X faulthandler redbarn-studio --self-test
+      - name: Install OBS and VB-CABLE on the test machine
+        shell: pwsh
+        timeout-minutes: 15
+        continue-on-error: true
+        run: |
+          Set-Service audiosrv -StartupType Automatic
+          Start-Service audiosrv
+          choco install obs-studio -y --no-progress | Select-Object -Last 3
+          $dll = "C:\Program Files\obs-studio\data\obs-plugins\win-dshow\obs-virtualcam-module64.dll"
+          if (Test-Path $dll) { regsvr32 /s $dll; Write-Output "registered OBS Virtual Camera" } else { Write-Output "OBS virtual camera module not found" }
+          Invoke-WebRequest https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip -OutFile cable.zip
+          Expand-Archive cable.zip cable
+          $p = Start-Process cable\VBCABLE_Setup_x64.exe -ArgumentList '-i','-h' -PassThru
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); Write-Output "VB-CABLE installer timed out" }
+          Get-PnpDevice -FriendlyName '*CABLE*' -ErrorAction SilentlyContinue | Format-Table -AutoSize FriendlyName, Status
+      - name: End-to-end
+        env:
+          GALLIUM_DRIVER: llvmpipe
+        run: python -u -X faulthandler .github/windows-e2e.py
