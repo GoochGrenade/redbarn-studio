@@ -34,7 +34,16 @@ Needs PipeWire, a webcam and a microphone.
 
 ## Windows
 
-A Windows version is in progress.
+**[Download Redbarn Studio for Windows](https://github.com/GoochGrenade/redbarn-studio/releases/download/v1.0.0-beta/Redbarn-Studio-Windows.zip)** (beta, 175 MB)
+
+This is a beta: it passes all automated tests on a Windows build server, but hasn't been tested on a real Windows PC yet.
+
+1. Install [OBS Studio](https://obsproject.com), which provides the virtual camera. You don't need to open it.
+2. Install [VB-CABLE](https://vb-audio.com/Cable/), which provides the virtual mic, then restart Windows.
+3. Unzip the download and open **Redbarn Studio.exe**. If Windows warns that it's from an unknown publisher, click **More info**, then **Run anyway**.
+4. In Discord, under **Settings > Voice & Video**, choose **OBS Virtual Camera** and **CABLE Output**. Keep Redbarn Studio open while you use them.
+
+If something's wrong, run `"Redbarn Studio.exe" --check` in a terminal in the unzipped folder to see what's missing. See the [release notes](https://github.com/GoochGrenade/redbarn-studio/releases/tag/v1.0.0-beta) for more help.
 
 ## Tips
 
