@@ -22,7 +22,10 @@ import time
 from datetime import datetime
 
 WINDOWS = sys.platform == "win32"
-if WINDOWS and sys.stdout:
+if WINDOWS and sys.stdout is None and len(sys.argv) > 1 and ctypes.windll.kernel32.AttachConsole(-1):
+    # The packaged app has no console of its own; print --check and --self-test to the one it was run from.
+    sys.stdout = sys.stderr = open("CONOUT$", "w", encoding="utf-8")
+elif WINDOWS and sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the console's default code page can't print ✓
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
@@ -925,7 +928,11 @@ class RedbarnStudio(Adw.Application):
         window.set_size_request(760, 600)
 
         brand = Gtk.Box(spacing=8)
-        brand.append(Gtk.Image(icon_name=APP_ID, pixel_size=24))
+        try:  # the app's own copy: Windows has no icon theme to find it in
+            logo = Gtk.Image(paintable=Gdk.Texture.new_from_bytes(GLib.Bytes.new(ICON_SVG.encode())), pixel_size=24)
+        except GLib.Error:
+            logo = Gtk.Image(icon_name=APP_ID, pixel_size=24)
+        brand.append(logo)
         brand.append(Gtk.Label(label=APP_NAME, css_classes=["brand"]))
         header = Adw.HeaderBar(title_widget=brand)
         self.status = Gtk.Label(css_classes=["pill"])

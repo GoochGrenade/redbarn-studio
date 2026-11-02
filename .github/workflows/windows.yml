@@ -32,6 +32,7 @@ jobs:
             mingw-w64-ucrt-x86_64-toolchain
             mingw-w64-ucrt-x86_64-pybind11
             mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-librsvg
             git
       - name: Build pyvirtualcam
         # Its setup.py passes an MSVC-only linker flag; MinGW needs -ladvapi32 instead.
@@ -69,3 +70,38 @@ jobs:
         env:
           GALLIUM_DRIVER: llvmpipe
         run: python -u -X faulthandler .github/windows-e2e.py
+      - name: Package
+        run: |
+          pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-python-pyinstaller mingw-w64-ucrt-x86_64-python-pyinstaller-hooks-contrib \
+            || pip install -q --break-system-packages pyinstaller pyinstaller-hooks-contrib
+          cp redbarn-studio redbarn_studio.py
+          python - <<'EOF'
+          import re
+          import gi
+          gi.require_version("GdkPixbuf", "2.0")
+          from gi.repository import GdkPixbuf
+          svg = re.search(r'ICON_SVG = """(.*?)"""', open("redbarn-studio", encoding="utf-8").read(), re.S).group(1)
+          loader = GdkPixbuf.PixbufLoader()
+          loader.write(svg.encode())
+          loader.close()
+          loader.get_pixbuf().scale_simple(256, 256, GdkPixbuf.InterpType.BILINEAR).savev("redbarn-studio.ico", "ico", [], [])
+          EOF
+          pyinstaller --noconfirm --log-level WARN .github/windows-package.spec
+          cp LICENSE README.md "dist/Redbarn Studio/"
+          du -sh "dist/Redbarn Studio"
+          echo "Mesa OpenGL files in the package (should be none):"; find "dist/Redbarn Studio" -iname "opengl32.dll" -o -iname "libgallium_wgl.dll"
+      - name: Test the package
+        # A copy gets Mesa, because the server has no GPU; the download itself never does.
+        run: |
+          cp -r "dist/Redbarn Studio" pkgtest
+          cp /ucrt64/bin/opengl32.dll /ucrt64/bin/libgallium_wgl.dll pkgtest/
+          export GALLIUM_DRIVER=llvmpipe
+          ./pkgtest/"Redbarn Studio.exe" --self-test && echo "packaged self-test passed" || { echo "packaged self-test failed: $?"; exit 1; }
+          ./pkgtest/"Redbarn Studio.exe" &
+          pid=$!
+          sleep 20
+          if kill -0 $pid 2>/dev/null; then echo "window still open after 20s"; kill $pid; else wait $pid; echo "app exited early with code $?"; exit 1; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Redbarn-Studio-Windows
+          path: dist/Redbarn Studio
