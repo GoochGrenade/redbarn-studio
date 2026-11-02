@@ -15,25 +15,38 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
-          update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-python
-            mingw-w64-ucrt-x86_64-python-gobject
-            mingw-w64-ucrt-x86_64-python-pip
-            mingw-w64-ucrt-x86_64-python-numpy
-            mingw-w64-ucrt-x86_64-gtk4
-            mingw-w64-ucrt-x86_64-libadwaita
-            mingw-w64-ucrt-x86_64-gstreamer
-            mingw-w64-ucrt-x86_64-gst-plugins-base
-            mingw-w64-ucrt-x86_64-gst-plugins-good
-            mingw-w64-ucrt-x86_64-gst-plugins-bad
-            mingw-w64-ucrt-x86_64-rubberband
-            mingw-w64-ucrt-x86_64-mesa
-            mingw-w64-ucrt-x86_64-toolchain
-            mingw-w64-ucrt-x86_64-pybind11
-            mingw-w64-ucrt-x86_64-ffmpeg
-            mingw-w64-ucrt-x86_64-librsvg
-            git
+          update: false
+      - name: Install MSYS2 packages
+        # mirror.msys2.org has stalled for whole runs; try university mirrors first, and retry.
+        run: |
+          for repo in mingw msys; do
+            list=/etc/pacman.d/mirrorlist.$repo
+            path='mingw/$repo'; [ $repo = msys ] && path='msys/$arch'
+            { for host in https://ftp.fau.de/msys2 https://mirrors.dotsrc.org/msys2; do echo "Server = $host/$path/"; done; cat $list; } > $list.new
+            mv $list.new $list
+          done
+          for attempt in 1 2 3; do
+            pacman -Sy --noconfirm --needed \
+              mingw-w64-ucrt-x86_64-python \
+              mingw-w64-ucrt-x86_64-python-gobject \
+              mingw-w64-ucrt-x86_64-python-pip \
+              mingw-w64-ucrt-x86_64-python-numpy \
+              mingw-w64-ucrt-x86_64-gtk4 \
+              mingw-w64-ucrt-x86_64-libadwaita \
+              mingw-w64-ucrt-x86_64-gstreamer \
+              mingw-w64-ucrt-x86_64-gst-plugins-base \
+              mingw-w64-ucrt-x86_64-gst-plugins-good \
+              mingw-w64-ucrt-x86_64-gst-plugins-bad \
+              mingw-w64-ucrt-x86_64-rubberband \
+              mingw-w64-ucrt-x86_64-mesa \
+              mingw-w64-ucrt-x86_64-toolchain \
+              mingw-w64-ucrt-x86_64-pybind11 \
+              mingw-w64-ucrt-x86_64-ffmpeg \
+              mingw-w64-ucrt-x86_64-librsvg \
+              git && break
+            echo "install attempt $attempt failed; retrying in 30s"; sleep 30
+            [ $attempt = 3 ] && exit 1
+          done
       - name: Build pyvirtualcam
         # Its setup.py passes an MSVC-only linker flag; MinGW needs -ladvapi32 instead.
         run: |
