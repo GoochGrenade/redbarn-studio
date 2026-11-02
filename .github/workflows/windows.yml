@@ -72,8 +72,7 @@ jobs:
         run: python -u -X faulthandler .github/windows-e2e.py
       - name: Package
         run: |
-          pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-python-pyinstaller mingw-w64-ucrt-x86_64-python-pyinstaller-hooks-contrib \
-            || pip install -q --break-system-packages pyinstaller pyinstaller-hooks-contrib
+          pip install -q --break-system-packages pyinstaller pyinstaller-hooks-contrib
           cp redbarn-studio redbarn_studio.py
           python - <<'EOF'
           import re
@@ -96,7 +95,10 @@ jobs:
           cp -r "dist/Redbarn Studio" pkgtest
           cp /ucrt64/bin/opengl32.dll /ucrt64/bin/libgallium_wgl.dll pkgtest/
           export GALLIUM_DRIVER=llvmpipe
-          ./pkgtest/"Redbarn Studio.exe" --self-test && echo "packaged self-test passed" || { echo "packaged self-test failed: $?"; exit 1; }
+          ./pkgtest/"Redbarn Studio.exe" --self-test | tee selftest.txt
+          grep -q "self-test passed" selftest.txt || { echo "packaged self-test failed"; exit 1; }
+          # The self-test skips pitch voices without Rubber Band; in the download that means a missing file.
+          if grep -q "Rubber Band isn't installed" selftest.txt; then echo "Rubber Band is missing from the package"; exit 1; fi
           ./pkgtest/"Redbarn Studio.exe" &
           pid=$!
           sleep 20
