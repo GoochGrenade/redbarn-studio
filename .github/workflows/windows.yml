@@ -60,29 +60,6 @@ jobs:
         env:
           GALLIUM_DRIVER: llvmpipe
         run: python -u -X faulthandler redbarn-studio --self-test
-      - name: Install OBS and VB-CABLE on the test machine
-        shell: pwsh
-        timeout-minutes: 15
-        continue-on-error: true
-        run: |
-          Set-Service audiosrv -StartupType Automatic
-          Start-Service audiosrv
-          # Windows privacy setting "Let desktop apps access your microphone"; often off on servers.
-          foreach ($k in "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone",
-                         "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone") {
-            New-Item -Path $k -Force | Out-Null
-            Set-ItemProperty -Path $k -Name Value -Value Allow
-          }
-          choco install obs-studio -y --no-progress | Select-Object -Last 3
-          Invoke-WebRequest https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip -OutFile cable.zip
-          Expand-Archive cable.zip cable
-          $p = Start-Process cable\VBCABLE_Setup_x64.exe -ArgumentList '-i','-h' -PassThru
-          if (-not $p.WaitForExit(180000)) { $p.Kill(); Write-Output "VB-CABLE installer timed out" }
-          Get-PnpDevice -FriendlyName '*CABLE*' -ErrorAction SilentlyContinue | Format-Table -AutoSize FriendlyName, Status
-      - name: End-to-end
-        env:
-          GALLIUM_DRIVER: llvmpipe
-        run: python -u -X faulthandler .github/windows-e2e.py
       - name: Package
         run: |
           pip install -q --break-system-packages pyinstaller pyinstaller-hooks-contrib
@@ -116,7 +93,73 @@ jobs:
           pid=$!
           sleep 20
           if kill -0 $pid 2>/dev/null; then echo "window still open after 20s"; kill $pid; else wait $pid; echo "app exited early with code $?"; exit 1; fi
+      - name: Take OBS's virtual camera module
+        # Only the camera module ships, not OBS Studio. OBS is GPL-2.0-or-later; its licence and source link go along.
+        shell: pwsh
+        env:
+          OBS_VERSION: 33.0.1
+          OBS_SHA256: 0d9436451c2d772b33428e3fdae9776f071895c335de17283176306fb72651d3
+        run: |
+          $zip = "obs.zip"
+          Invoke-WebRequest "https://github.com/obsproject/obs-studio/releases/download/$env:OBS_VERSION/OBS-Studio-$env:OBS_VERSION-Windows-x64.zip" -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $env:OBS_SHA256) { throw "OBS zip doesn't match its pinned SHA-256" }
+          Expand-Archive $zip obs
+          New-Item -ItemType Directory virtualcam | Out-Null
+          Get-ChildItem obs -Recurse -Filter "obs-virtualcam-module*.dll" | ForEach-Object { Write-Output $_.FullName; Copy-Item $_.FullName virtualcam }
+          if ((Get-ChildItem virtualcam).Count -lt 2) { throw "virtual camera modules not found in the OBS zip" }
+          Invoke-WebRequest "https://raw.githubusercontent.com/obsproject/obs-studio/$env:OBS_VERSION/COPYING" -OutFile virtualcam/COPYING.txt
+          Set-Content virtualcam/README.txt "OBS Virtual Camera module from OBS Studio $env:OBS_VERSION (https://obsproject.com).`r`nLicensed under the GNU GPL version 2 or later: see COPYING.txt.`r`nSource code: https://github.com/obsproject/obs-studio/tree/$env:OBS_VERSION"
+      - name: Show the camera module's DLL imports
+        # Anything here that isn't a Windows system DLL would have to ship too.
+        run: for f in virtualcam/*.dll; do echo "$f:"; objdump -p "$f" | grep "DLL Name"; done
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress | Select-Object -Last 2
+          $env:APP_VERSION = (Select-String -Path redbarn-studio -Pattern '^VERSION = "(.+)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q .github\windows-installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Get-Item installer\Redbarn-Studio-Setup.exe | Format-Table Name, Length
+      - name: Install it, as a user would
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          Set-Service audiosrv -StartupType Automatic
+          Start-Service audiosrv
+          # Windows privacy setting "Let desktop apps access your microphone"; often off on servers.
+          foreach ($k in "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone",
+                         "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone") {
+            New-Item -Path $k -Force | Out-Null
+            Set-ItemProperty -Path $k -Name Value -Value Allow
+          }
+          $p = Start-Process installer\Redbarn-Studio-Setup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=vbcable', '/LOG=install.log' -PassThru
+          if (-not $p.WaitForExit(480000)) { $p.Kill(); Get-Content install.log -Tail 30; throw "installer timed out" }
+          Get-Content install.log | Select-String "VB-CABLE|regsvr32|Exit code|error" | Select-Object -Last 15
+          if (-not (Test-Path "$env:ProgramFiles\Redbarn Studio\Redbarn Studio.exe")) { throw "app not installed" }
+          $cam = (Get-ItemProperty "Registry::HKEY_CLASSES_ROOT\CLSID\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}\InprocServer32" -ErrorAction SilentlyContinue).'(default)'
+          Write-Output "virtual camera registered at: $cam"
+          if (-not $cam) { throw "virtual camera isn't registered" }
+          Get-PnpDevice -FriendlyName '*CABLE*' -ErrorAction SilentlyContinue | Format-Table -AutoSize FriendlyName, Status
+      - name: End-to-end, through the installed camera and VB-CABLE
+        env:
+          GALLIUM_DRIVER: llvmpipe
+        run: python -u -X faulthandler .github/windows-e2e.py
+      - name: Check the installed app
+        # bash, as in "Test the package": it captures a windowed program's output, which PowerShell doesn't.
+        run: |
+          "/c/Program Files/Redbarn Studio/Redbarn Studio.exe" --check | tee check.txt
+          grep -q "OBS Virtual Camera" check.txt || { echo "no --check output"; exit 1; }
+          if grep -E "✗ (OBS Virtual Camera|VB-CABLE)" check.txt; then echo "installed app can't find the virtual camera or mic"; exit 1; fi
+      - name: Uninstall, as a user would
+        shell: pwsh
+        run: |
+          $p = Start-Process "$env:ProgramFiles\Redbarn Studio\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -PassThru
+          $p.WaitForExit(120000) | Out-Null
+          Start-Sleep 5  # the uninstaller finishes removing itself from a copy in the temp folder
+          if (Test-Path "$env:ProgramFiles\Redbarn Studio\Redbarn Studio.exe") { throw "app still installed" }
+          if (Test-Path "Registry::HKEY_CLASSES_ROOT\CLSID\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}\InprocServer32") { throw "virtual camera still registered" }
+          Write-Output "uninstalled cleanly"
       - uses: actions/upload-artifact@v4
         with:
-          name: Redbarn-Studio-Windows
-          path: dist/Redbarn Studio
+          name: Redbarn-Studio-Setup
+          path: installer/Redbarn-Studio-Setup.exe

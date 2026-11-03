@@ -22,6 +22,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
 from datetime import datetime
@@ -34,17 +35,18 @@ elif WINDOWS and sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the console's default code page can't print ✓
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
-VERSION = "1.1.4"
+VERSION = "1.2.0"
 REPO_URL = "https://github.com/GoochGrenade/redbarn-studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
 MIC_NAME = "CABLE Output" if WINDOWS else "Redbarn Mic"  # what to pick in Discord
 MIC_NODE, OUTPUT_NODE = "redbarn_mic", "redbarn_output"
 RUBBERBAND_NAMES = ("librubberband.so.3", "librubberband.so.2", "librubberband-3.dll")  # Fedora, Ubuntu/Debian, Windows
 VIDIOC_QUERYCAP = 0x80685600
-WINDOWS_DOWNLOADS = {"obs": "https://obsproject.com", "cable": "https://vb-audio.com/Cable/"}
+WINDOWS_DOWNLOADS = {"obs": f"{REPO_URL}/releases", "cable": "https://vb-audio.com/Cable/"}
 WINDOWS_HELP = {
-    "obs": f"Install OBS Studio from {WINDOWS_DOWNLOADS['obs']}. You don't need to open it; it provides the virtual camera.",
-    "cable": f"Install VB-CABLE from {WINDOWS_DOWNLOADS['cable']}, then restart Windows. It provides the virtual mic.",
+    "obs": f"Run the Redbarn Studio installer again to add the virtual camera: {WINDOWS_DOWNLOADS['obs']}",
+    "cable": f"Install VB-CABLE from {WINDOWS_DOWNLOADS['cable']}: unzip it, run VBCABLE_Setup_x64.exe, then restart Windows. "
+             "The Redbarn Studio installer can also do this for you.",
 }
 # VB-CABLE's playback side is "CABLE Input" on most PCs but can be named "Speakers (VB-Audio Virtual Cable)".
 CABLE_INPUT = ("CABLE Input", "VB-Audio Virtual Cable")
@@ -73,16 +75,28 @@ ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" v
 
 
 def pactl(*args):
-    return subprocess.run(["pactl", *args], capture_output=True, text=True, timeout=5).stdout.strip()
+    # LC_ALL=C: `pactl list` labels like "Name:" are translated otherwise, and get parsed below.
+    return subprocess.run(["pactl", *args], capture_output=True, text=True, timeout=5,
+                          env={**os.environ, "LC_ALL": "C"}).stdout.strip()
 
 
 def windows_device(device_class, id_property, want=None):
     """ID of a Windows device: the first whose name contains `want` (a name or names, in order of preference),
-    or else the default real one.
+    or else the default real one."""
+    devices = windows_devices(device_class, real=not want)
+    if want:
+        wants = (want,) if isinstance(want, str) else want
+        # VB-CABLE's 16-channel variant isn't the one Discord's "CABLE Output" mic carries.
+        devices = [d for w in wants for d in devices if w in d.get_display_name() and "16 Ch" not in d.get_display_name()]
+    return devices[0].create_element(None).get_property(id_property) if devices else None
 
-    Virtual devices are skipped by default, so the app never reads its own virtual camera or mic: that
-    would be a feedback loop. So are Windows's speaker-recording sources and its "Default ..." placeholders,
-    which can stand for one of those.
+
+def windows_devices(device_class, real=True):
+    """Windows devices of a class, the default first.
+
+    With `real`, virtual devices are skipped, so the app never reads its own virtual camera or mic: that
+    would be a feedback loop. Windows's speaker-recording sources are always skipped, and so are its
+    "Default ..." placeholders, which can stand for one of those.
     """
     from gi.repository import Gst
     Gst.init(None)
@@ -95,16 +109,12 @@ def windows_device(device_class, id_property, want=None):
 
     devices = [d for d in monitor.get_devices() if not loopback(d)]
     monitor.stop()
-    if want:
-        wants = (want,) if isinstance(want, str) else want
-        # VB-CABLE's 16-channel variant isn't the one Discord's "CABLE Output" mic carries.
-        matches = [d for w in wants for d in devices if w in d.get_display_name() and "16 Ch" not in d.get_display_name()]
-    else:
-        matches = [d for d in devices if not any(v in d.get_display_name() for v in ("CABLE", "OBS", "Virtual"))
+    if real:
+        devices = [d for d in devices if not any(v in d.get_display_name() for v in ("CABLE", "OBS", "Virtual"))
                    and not d.get_display_name().startswith("Default ")]
-        matches.sort(key=lambda d: not (d.get_properties() and d.get_properties().has_field("device.default")
-                                        and d.get_properties().get_value("device.default")))
-    return matches[0].create_element(None).get_property(id_property) if matches else None
+    devices.sort(key=lambda d: not (d.get_properties() and d.get_properties().has_field("device.default")
+                                    and d.get_properties().get_value("device.default")))
+    return devices
 
 
 def find_mic():
@@ -113,6 +123,28 @@ def find_mic():
     # Never read our own virtual mic: that would be a feedback loop.
     mic = pactl("get-default-source")
     return mic if mic and mic not in (MIC_NODE, f"{OUTPUT_NODE}.monitor") else None
+
+
+def parse_sources(text):
+    """[(name, description)] of the real mics in `pactl list sources` output."""
+    mics, name = [], None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("Name: "):
+            name = line[len("Name: "):]
+        elif line.startswith("Description: ") and name:
+            # Monitors record speakers, and our own mic would be a feedback loop.
+            if not name.endswith(".monitor") and name != MIC_NODE:
+                mics.append((name, line[len("Description: "):]))
+            name = None
+    return mics
+
+
+def list_mics():
+    """[(device id, name)] of the real mics, the default first on Windows."""
+    if WINDOWS:
+        return [(d.create_element(None).get_property("device"), d.get_display_name()) for d in windows_devices("Audio/Source")]
+    return parse_sources(pactl("list", "sources"))
 
 
 def find_webcam():
@@ -858,7 +890,7 @@ SETTINGS_FILE = os.path.join(GLib.get_user_config_dir(), "redbarn-studio", "sett
 ICON_DIR = os.path.join(GLib.get_user_cache_dir(), "redbarn-studio", "icons")
 ICONS = {
     "look": "camera-photo-symbolic", "mirror": "view-mirror-symbolic", "flip": "object-flip-vertical-symbolic",
-    "voice": "audio-input-microphone-symbolic", "monitor": "audio-headphones-symbolic", "volume": "audio-volume-high-symbolic",
+    "voice": "face-smile-symbolic", "mic": "audio-input-microphone-symbolic", "monitor": "audio-headphones-symbolic", "volume": "audio-volume-high-symbolic",
     "my_volume": "audio-speakers-symbolic",
     "dark": "weather-clear-night-symbolic", "add": "list-add-symbolic", "folder": "folder-open-symbolic",
     "stop": "media-playback-stop-symbolic", "menu": "open-menu-symbolic", "camera_off": "camera-disabled-symbolic",
@@ -1074,6 +1106,12 @@ class RedbarnStudio(Adw.Application):
         self.sounds = []
         self.sound_files = None
         self.ticking = None
+        self.mics = []  # [(device id, name)] as last listed
+        self.mic_id = None  # the mic the voice pipeline is reading
+        self.mic_choice = None  # a mic's name, or None for Automatic
+        self.mic_poll = 0
+        self.polling = False
+        self.updating_mics = False
 
     def do_activate(self):
         # Reopening from the launcher lands here: starting again would kill the live stream.
@@ -1136,6 +1174,8 @@ class RedbarnStudio(Adw.Application):
         self.mirror.connect("notify::active", self.on_mirror)
         self.flip_camera = Adw.SwitchRow(title="Flip Camera", subtitle="Turn the picture upside down")
         self.flip_camera.connect("notify::active", self.on_flip_camera)
+        self.mic_menu = Adw.ComboRow(title="Microphone", model=Gtk.StringList.new(["Automatic"]))
+        self.mic_menu.connect("notify::selected", self.on_mic_choice)
         self.voice_menu = Adw.ComboRow(title="Voice", model=Gtk.StringList.new(list(VOICES)))
         self.voice_menu.connect("notify::selected", self.on_voice)
         self.monitor = Adw.SwitchRow(title="Voice Playback", subtitle="Use headphones to avoid feedback")
@@ -1184,13 +1224,13 @@ class RedbarnStudio(Adw.Application):
         self.load_sounds()
         window.connect("notify::is-active", lambda w, _: w.is_active() and self.load_sounds())  # picks up folder edits
 
-        for row, icon in ((self.look_menu, "look"), (self.mirror, "mirror"), (self.flip_camera, "flip"), (self.voice_menu, "voice"),
+        for row, icon in ((self.look_menu, "look"), (self.mirror, "mirror"), (self.flip_camera, "flip"), (self.mic_menu, "mic"), (self.voice_menu, "voice"),
                           (self.monitor, "monitor"), (self.dark, "dark")):
             row.add_prefix(Gtk.Image(icon_name=ICONS[icon]))
         settings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_start=8, margin_end=16, margin_top=8, margin_bottom=8)
         for title, description, rows in (
             ("Camera", "Select the virtual camera as your camera source.", (self.look_menu, self.mirror, self.flip_camera)),
-            ("Voice", f"Select '{MIC_NAME}' in your voice chat settings.", (self.voice_menu, self.monitor)),
+            ("Voice", f"Select '{MIC_NAME}' in your voice chat settings.", (self.mic_menu, self.voice_menu, self.monitor)),
             ("Appearance", None, (self.dark,)),
         ):
             group = Adw.PreferencesGroup(title=title, description=description)
@@ -1228,6 +1268,8 @@ class RedbarnStudio(Adw.Application):
         # Checked one by one: the file is hand-editable, so any value may be missing or the wrong type.
         if isinstance(saved.get("look"), str) and saved["look"] in LOOKS:
             self.look_menu.set_selected(LOOKS.index(saved["look"]))
+        if isinstance(saved.get("mic"), str) and saved["mic"] in [name for _, name in self.mics]:
+            self.mic_menu.set_selected([name for _, name in self.mics].index(saved["mic"]) + 1)
         if isinstance(saved.get("voice"), str) and saved["voice"] in VOICES:
             self.voice_menu.set_selected(list(VOICES).index(saved["voice"]))
         for key, row in (("mirror", self.mirror), ("flip", self.flip_camera), ("dark", self.dark)):
@@ -1239,7 +1281,7 @@ class RedbarnStudio(Adw.Application):
             self.my_volume.set_value(saved["my_sound_level"])
 
     def current_settings(self):
-        return {"look": self.look, "voice": list(VOICES)[self.voice_menu.get_selected()], "mirror": self.mirror.get_active(),
+        return {"look": self.look, "mic": self.mic_choice, "voice": list(VOICES)[self.voice_menu.get_selected()], "mirror": self.mirror.get_active(),
                 "flip": self.flip_camera.get_active(), "dark": self.dark.get_active(), "sound_level": round(self.volume.get_value(), 2),
                 "my_sound_level": round(self.my_volume.get_value(), 2)}
 
@@ -1385,39 +1427,104 @@ class RedbarnStudio(Adw.Application):
     def start_voice(self):
         # Separate from the camera on purpose: a mic problem must not stop the video, or the reverse.
         try:
-            mic = find_mic()
-            if not mic:
-                self.voice_off("No microphone found, so voice filters are off.")
-                return
             self.virtual_mic, output = start_virtual_mic()
-            if not output:
-                help_text = f" {WINDOWS_HELP['cable']}" if WINDOWS else ""
-                self.voice_off(f"Couldn't create the virtual mic, so voice filters are off.{help_text}")
-                return
-            self.sound_output = output
-            self.voice_pipeline = build_voice_pipeline(mic, output)
-        except (GLib.Error, OSError, subprocess.SubprocessError) as e:
+            self.mics = list_mics()
+        except (OSError, subprocess.SubprocessError) as e:
             self.voice_off(f"Voice filters are off: {e}")
+            return
+        if not output:
+            help_text = f" {WINDOWS_HELP['cable']}" if WINDOWS else ""
+            self.voice_off(f"Couldn't create the virtual mic, so voice filters are off.{help_text}")
+            return
+        self.sound_output = output
+        self.show_mics()
+        self.restart_voice(find_mic())
+        GLib.timeout_add_seconds(1, self.check_mic)
+
+    def restart_voice(self, mic):
+        """Read from another mic. Only the voice pipeline is rebuilt: apps using the virtual mic keep it."""
+        if self.voice_pipeline:
+            self.voice_pipeline.get_bus().remove_signal_watch()
+            stop(self.voice_pipeline)
+            self.voice_pipeline = None
+        self.mic_id = mic
+        # Only Automatic needs saying which mic it found; a picked mic is already shown in the menu.
+        automatic = self.mic_choice is None
+        self.mic_menu.set_subtitle(GLib.markup_escape_text(f"Using {self.mic_name(mic)}") if mic and automatic else "")
+        if not mic:
+            self.voice_off("No microphone found, so voice filters are off. Plug one in and it'll be picked up.")
+            return
+        try:
+            self.voice_pipeline = build_voice_pipeline(mic, self.sound_output)
+        except GLib.Error as e:
+            self.voice_off(f"Voice filters are off: {e.message}")
             return
         bus = self.voice_pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message::error", self.on_voice_error)
         self.voice_pipeline.get_by_name("mic").get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, self.on_mic_audio)
+        set_voice(self.voice_pipeline, list(VOICES)[self.voice_menu.get_selected()])
         self.last_mic_audio = time.monotonic()
         self.voice_pipeline.set_state(Gst.State.PLAYING)
+        for row in (self.voice_menu, self.monitor):
+            row.set_sensitive(True)
         self.set_status(self.voice_status, "live", "Mic live")
-        GLib.timeout_add_seconds(1, self.check_mic)
+
+    def mic_name(self, mic):
+        return next((name for device, name in self.mics if device == mic), mic)
+
+    def show_mics(self):
+        """Refill the Microphone menu from self.mics, keeping the current choice selected."""
+        # Never called from on_mic_choice: a model change there re-fires the selection, in a loop.
+        self.updating_mics = True
+        names = [name for _, name in self.mics]
+        self.mic_menu.set_model(Gtk.StringList.new(["Automatic", *names]))
+        self.mic_menu.set_selected(names.index(self.mic_choice) + 1 if self.mic_choice in names else 0)
+        self.updating_mics = False
+
+    def on_mic_choice(self, menu, _param):
+        index = menu.get_selected()
+        if self.updating_mics or not self.sound_output or index > len(self.mics):
+            return
+        choice = self.mics[index - 1][1] if index else None
+        if choice == self.mic_choice:
+            return
+        self.mic_choice = choice
+        self.restart_voice(self.mics[index - 1][0] if index else find_mic())
+
+    def poll_mics(self):
+        # In a thread: listing Windows devices can take long enough to stutter the window.
+        try:
+            mics, default = list_mics(), find_mic()
+        except (OSError, subprocess.SubprocessError):
+            mics, default = self.mics, self.mic_id
+        GLib.idle_add(self.on_mics_polled, mics, default)
+
+    def on_mics_polled(self, mics, default):
+        self.polling = False
+        if mics != self.mics:
+            self.mics = mics
+            self.show_mics()
+        if self.mic_choice is None and default != self.mic_id:
+            self.restart_voice(default)
+            if default:
+                self.toasts.add_toast(Adw.Toast(title=f"Now using {self.mic_name(default)}"))
+        return False
 
     def on_mic_audio(self, _pad, _info):
         self.last_mic_audio = time.monotonic()
         return Gst.PadProbeReturn.OK
 
     def check_mic(self):
-        # A missing mic raises no error: pulsesrc just waits, and Discord would get silence.
-        if not self.voice_pipeline:
-            return False
         if self.monitor_process and not running(self.monitor_process):
             self.monitor.set_active(False)
+        self.mic_poll = (self.mic_poll + 1) % 2
+        if not self.mic_poll and not self.polling:  # every 2 seconds: a headset may have been plugged in
+            self.polling = True
+            threading.Thread(target=self.poll_mics, daemon=True).start()
+        # A missing mic raises no error: pulsesrc just waits, and Discord would get silence.
+        if not self.voice_pipeline:
+            return True
         voice = VOICES[list(VOICES)[self.voice_menu.get_selected()]]
         if time.monotonic() - self.last_mic_audio > 2:
             self.set_status(self.voice_status, "warn", "No mic audio", MIC_LOST)
@@ -1428,6 +1535,7 @@ class RedbarnStudio(Adw.Application):
         return True
 
     def voice_off(self, reason):
+        self.mic_menu.set_sensitive(bool(self.sound_output))  # with the virtual mic up, another mic can still be picked
         self.voice_menu.set_sensitive(False)
         self.monitor.set_active(False)
         self.monitor.set_sensitive(False)
@@ -1590,8 +1698,10 @@ class RedbarnStudio(Adw.Application):
         hint = (" In Windows Settings, open Privacy & security > Microphone and turn on "
                 "\"Let desktop apps access your microphone\"." if WINDOWS and message.src.get_name() == "mic" else "")
         self.voice_off(f"Voice filters stopped: {message.parse_error()[0].message}.{hint} The camera is unaffected.")
+        self.voice_pipeline.get_bus().remove_signal_watch()
         self.voice_pipeline.set_state(Gst.State.NULL)
         self.voice_pipeline = None
+        self.mic_id = None  # so Automatic tries again on its next check
 
     def on_close(self, _window):
         try:
@@ -1856,6 +1966,23 @@ def check_sounds():
                 assert tss > 3 * drum, "Ba-Dum-Tss has no bright cymbal after the drums"
 
 
+def check_mic_list():
+    sample = """Source #1
+	Name: alsa_output.pci.analog-stereo.monitor
+	Description: Monitor of Built-in Audio
+Source #2
+	Name: alsa_input.usb-headset.mono
+	Description: USB Headset Mono
+Source #3
+	Name: redbarn_mic
+	Description: Redbarn Mic
+Source #4
+	Name: alsa_input.pci.analog-stereo
+	Description: Built-in Audio Analog Stereo"""
+    assert parse_sources(sample) == [("alsa_input.usb-headset.mono", "USB Headset Mono"),
+                                     ("alsa_input.pci.analog-stereo", "Built-in Audio Analog Stereo")], "mic list is wrong"
+
+
 def check_settings():
     global SETTINGS_FILE
     with tempfile.TemporaryDirectory() as folder:
@@ -1948,6 +2075,7 @@ def self_test():
     check_formants()
     check_sounds()
     check_settings()
+    check_mic_list()
     check_icons()
     missing = [name for name in GST_ELEMENTS if not Gst.ElementFactory.find(name)]
     assert not missing, f"missing GStreamer elements: {missing}"
