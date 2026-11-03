@@ -12,6 +12,7 @@ import array
 import ctypes
 import ctypes.util
 import glob
+import json
 import math
 import os
 import random
@@ -33,14 +34,17 @@ elif WINDOWS and sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the console's default code page can't print ✓
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
+VERSION = "1.1.0"
+REPO_URL = "https://github.com/GoochGrenade/redbarn-studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
 MIC_NAME = "CABLE Output" if WINDOWS else "Redbarn Mic"  # what to pick in Discord
 MIC_NODE, OUTPUT_NODE = "redbarn_mic", "redbarn_output"
 RUBBERBAND_NAMES = ("librubberband.so.3", "librubberband.so.2", "librubberband-3.dll")  # Fedora, Ubuntu/Debian, Windows
 VIDIOC_QUERYCAP = 0x80685600
+WINDOWS_DOWNLOADS = {"obs": "https://obsproject.com", "cable": "https://vb-audio.com/Cable/"}
 WINDOWS_HELP = {
-    "obs": "Install OBS Studio from https://obsproject.com. You don't need to open it; it provides the virtual camera.",
-    "cable": "Install VB-CABLE from https://vb-audio.com/Cable/, then restart Windows. It provides the virtual mic.",
+    "obs": f"Install OBS Studio from {WINDOWS_DOWNLOADS['obs']}. You don't need to open it; it provides the virtual camera.",
+    "cable": f"Install VB-CABLE from {WINDOWS_DOWNLOADS['cable']}, then restart Windows. It provides the virtual mic.",
 }
 # VB-CABLE's playback side is "CABLE Input" on most PCs but can be named "Speakers (VB-Audio Virtual Cable)".
 CABLE_INPUT = ("CABLE Input", "VB-Audio Virtual Cable")
@@ -215,6 +219,23 @@ def requirements():
     return results
 
 
+def fix_text(package):
+    """How to get a missing part: a download on Windows, or the install command for this Linux distribution."""
+    if WINDOWS:
+        return WINDOWS_HELP[package]
+    fedora, debian = PACKAGES[package]
+    try:
+        with open("/etc/os-release") as f:
+            release = f.read().lower()
+    except OSError:
+        release = ""
+    if "fedora" in release:
+        return f"sudo dnf install {fedora}"
+    if "debian" in release or "ubuntu" in release:
+        return f"sudo apt install {debian}"
+    return f"Fedora: sudo dnf install {fedora}\nUbuntu/Debian: sudo apt install {debian}"
+
+
 def report():
     print(f"\n{APP_NAME} requirements:")
     results = requirements()
@@ -222,11 +243,8 @@ def report():
         print(f"  {'✓' if ok else '✗'} {what}")
         if not ok:
             print(f"      Without it {effect}.")
-            if package and WINDOWS:
-                print(f"      {WINDOWS_HELP[package]}")
-            elif package:
-                fedora, debian = PACKAGES[package]
-                print(f"      Fedora: sudo dnf install {fedora}\n      Ubuntu/Debian: sudo apt install {debian}")
+            if package:
+                print("      " + fix_text(package).replace("\n", "\n      "))
     print("\nEverything's ready." if all(ok for ok, *_ in results) else "\nInstall what's marked ✗, then run this again.")
 
 
@@ -660,7 +678,7 @@ VOICES = {
     "Ghost": {"pitch": 1.06, "formant": 1.15, "highpass": 250.0, "echo": (260, 0.4, 0.4), "reverb": 0.55},
     "Ghostface": {"pitch": 0.78, "formant": 0.85, "highpass": 120.0, "lowpass": 4000.0, "drive": 1.8, "echo": (8, 0.35, 0.3)},
 }
-RUBBERBAND_MISSING = "This voice needs the Rubber Band library, so it sounds like Normal. Run redbarn-studio --check."
+RUBBERBAND_MISSING = "This voice needs the Rubber Band library, so it sounds like Normal. Open Setup & Help (F1) to fix it."
 MIC_LOST = f"No sound is reaching {APP_NAME} from your mic. Check it's plugged in."
 # Device IDs are set as properties after parsing: Windows paths contain characters the parser would mangle.
 if WINDOWS:
@@ -834,9 +852,19 @@ def build_voice_pipeline(mic, output):
 
 
 SOUND_TYPES = (".mp3", ".wav", ".ogg", ".opus")
+SETTINGS_FILE = os.path.join(GLib.get_user_config_dir(), "redbarn-studio", "settings.json")
+ICON_DIR = os.path.join(GLib.get_user_cache_dir(), "redbarn-studio", "icons")
+ICONS = {
+    "look": "camera-photo-symbolic", "mirror": "view-mirror-symbolic", "flip": "object-flip-vertical-symbolic",
+    "voice": "audio-input-microphone-symbolic", "monitor": "audio-headphones-symbolic", "volume": "audio-volume-high-symbolic",
+    "dark": "weather-clear-night-symbolic", "add": "list-add-symbolic", "folder": "folder-open-symbolic",
+    "stop": "media-playback-stop-symbolic", "menu": "open-menu-symbolic", "camera_off": "camera-disabled-symbolic",
+    "ok": "object-select-symbolic", "warning": "dialog-warning-symbolic", "copy": "edit-copy-symbolic",
+    "link": "web-browser-symbolic", "app": APP_ID,
+}
 SOUNDS_DIR = os.path.join(GLib.get_user_data_dir(), "redbarn-studio", "sounds")
 # Versioned: bump it when a recipe changes, or old copies would keep playing.
-BUILTIN_DIR = os.path.join(GLib.get_user_cache_dir(), "redbarn-studio", "sounds-1")
+BUILTIN_DIR = os.path.join(GLib.get_user_cache_dir(), "redbarn-studio", "sounds-2")
 RATE = 48000
 BRASS = {1: 1.0, 2: 0.5, 3: 0.35, 4: 0.2, 5: 0.1}
 
@@ -857,6 +885,17 @@ def hiss(seconds, decay):
     return [(b - a) * 0.5 * math.exp(-decay * i / RATE) for i, (a, b) in enumerate(zip(noise, noise[1:]))]  # differences: high-pass
 
 
+def drum(freq):
+    """A drum hit: a falling pitched body plus a burst of rattle."""
+    return [body + 0.5 * rattle for body, rattle in zip(note(freq, 0.3, {1: 1.0, 1.5: 0.3}, decay=14, glide=0.4), hiss(0.3, 30))]
+
+
+def cymbal(seconds=1.2):
+    noise = hiss(seconds + 1 / RATE, 3.5)
+    shimmer = note(3150, seconds, {1: 1.0, 1.47: 0.8, 2.09: 0.6, 2.71: 0.5}, decay=4)
+    return [0.5 * (b - a) + 0.12 * ring for a, b, ring in zip(noise, noise[1:], shimmer)]  # differenced again: brighter
+
+
 def horn(seconds):
     return [math.tanh(2.5 * (a + b)) for a, b in zip(note(466, seconds, BRASS), note(587, seconds, BRASS))]
 
@@ -864,8 +903,7 @@ def horn(seconds):
 # Original sounds, made here: each is a list of (start in seconds, samples).
 SOUNDS = {
     "Air Horn": lambda: [(start, horn(length)) for start, length in ((0, 0.12), (0.17, 0.12), (0.34, 0.7))],
-    "Ba-Dum-Tss": lambda: [(0, note(180, 0.25, decay=12, glide=0.5)), (0.2, note(140, 0.25, decay=12, glide=0.5)),
-                           (0.45, hiss(1.0, 5))],
+    "Ba-Dum-Tss": lambda: [(0, drum(220)), (0.17, drum(150)), (0.42, cymbal())],
     "Sad Trombone": lambda: [(i * 0.45, note(freq, 1.3 if i == 3 else 0.42, BRASS, vibrato=0.03 if i == 3 else 0))
                              for i, freq in enumerate((293.7, 277.2, 261.6, 246.9))],
     "Buzzer": lambda: [(0, note(110, 0.8, {1: 1.0, 3: 0.33, 5: 0.2, 7: 0.14}))],
@@ -914,6 +952,31 @@ def play_sound(path, sink, volume, device=None):
     player.set_property("volume", volume)
     player.set_state(Gst.State.PLAYING)
     return player
+
+
+def load_settings():
+    """Saved settings, or {} if there are none or the file is damaged."""
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def save_settings(settings):
+    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+    with open(SETTINGS_FILE + ".part", "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+    os.replace(SETTINGS_FILE + ".part", SETTINGS_FILE)  # a crash mid-write can't leave a half-written file
+
+
+def add_app_icon(display):
+    """Lets the logo be found by name: Windows has no installed copy, and the About dialog needs one."""
+    os.makedirs(ICON_DIR, exist_ok=True)
+    with open(os.path.join(ICON_DIR, f"{APP_ID}.svg"), "w", encoding="utf-8") as f:
+        f.write(ICON_SVG)
+    Gtk.IconTheme.get_for_display(display).add_search_path(ICON_DIR)
 
 
 def set_look(fx, name):
@@ -1006,77 +1069,111 @@ class RedbarnStudio(Adw.Application):
         self.sound_output = None
         self.sounds = []
         self.sound_files = None
+        self.ticking = None
 
     def do_activate(self):
         # Reopening from the launcher lands here: starting again would kill the live stream.
         if self.get_active_window():
             self.get_active_window().present()
             return
+        display = Gdk.Display.get_default()
         provider = Gtk.CssProvider()
         provider.load_from_string(CSS)
-        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        add_app_icon(display)
         Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
         Gtk.Window.set_default_icon_name(APP_ID)
-        window = Adw.ApplicationWindow(application=self, title=APP_NAME, default_width=1040, default_height=680)
+        window = Adw.ApplicationWindow(application=self, title=APP_NAME, default_width=1080, default_height=720)
         window.add_css_class("dark-ui")
-        window.set_size_request(760, 600)
+        window.set_size_request(780, 600)
+        for name, handler, accels in (("help", self.show_help, ["F1"]), ("report", self.report_problem, []),
+                                      ("about", self.show_about, []), ("quit", self.quit_app, ["<Control>q"])):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda *_, handler=handler: handler())
+            self.add_action(action)
+            self.set_accels_for_action(f"app.{name}", accels)
+        menu = Gio.Menu()
+        for label, action in (("Setup & Help", "app.help"), ("Report a Problem", "app.report"),
+                              (f"About {APP_NAME}", "app.about"), ("Quit", "app.quit")):
+            menu.append(label, action)
 
         brand = Gtk.Box(spacing=8)
-        try:  # the app's own copy: Windows has no icon theme to find it in
-            logo = Gtk.Image(paintable=Gdk.Texture.new_from_bytes(GLib.Bytes.new(ICON_SVG.encode())), pixel_size=24)
-        except GLib.Error:
-            logo = Gtk.Image(icon_name=APP_ID, pixel_size=24)
-        brand.append(logo)
+        brand.append(Gtk.Image(icon_name=ICONS["app"], pixel_size=24))
         brand.append(Gtk.Label(label=APP_NAME, css_classes=["brand"]))
         header = Adw.HeaderBar(title_widget=brand)
         self.status = Gtk.Label(css_classes=["pill"])
         self.voice_status = Gtk.Label(css_classes=["pill"])
         header.pack_start(self.status)
         header.pack_start(self.voice_status)
-        self.banner = Adw.Banner()
+        header.pack_end(Gtk.MenuButton(icon_name=ICONS["menu"], menu_model=menu, primary=True, tooltip_text="Main menu"))
+        self.banner = Adw.Banner(button_label="Help")
+        self.banner.connect("button-clicked", lambda _: self.show_help())
         copyright_line = Gtk.Label(label=COPYRIGHT, css_classes=["copyright"], margin_top=6, margin_bottom=6)
 
         self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, css_classes=["preview"], overflow=Gtk.Overflow.HIDDEN)
         frame = Gtk.AspectFrame(ratio=16 / 9, obey_child=False, hexpand=True, vexpand=True, child=self.picture)
-        stage = Gtk.Box(margin_start=16, margin_end=8, margin_top=8, margin_bottom=8)
-        stage.append(frame)
+        retry = Gtk.Button(label="Try Again", css_classes=["pill", "suggested-action"])
+        retry.connect("clicked", lambda _: self.start())
+        get_help = Gtk.Button(label="Setup & Help", css_classes=["pill"])
+        get_help.connect("clicked", lambda _: self.show_help())
+        off_buttons = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+        off_buttons.append(retry)
+        off_buttons.append(get_help)
+        self.camera_off_page = Adw.StatusPage(icon_name=ICONS["camera_off"], title="Camera Off", child=off_buttons, hexpand=True)
+        self.stage = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, margin_start=16, margin_end=8,
+                               margin_top=8, margin_bottom=8)
+        self.stage.add_named(frame, "live")
+        self.stage.add_named(self.camera_off_page, "off")
 
         self.look_menu = Adw.ComboRow(title="Look", model=Gtk.StringList.new(LOOKS))
         self.look_menu.connect("notify::selected", self.on_look)
         # Discord mirrors your own view of your camera, so correct text can look backwards to you alone.
         self.mirror = Adw.SwitchRow(title="Mirror overlay text", subtitle="Turn off if viewers see it backwards", active=True)
         self.mirror.connect("notify::active", self.on_mirror)
-        self.flip_camera = Adw.SwitchRow(title="Flip camera")
+        self.flip_camera = Adw.SwitchRow(title="Flip camera", subtitle="Turn the picture upside down")
         self.flip_camera.connect("notify::active", self.on_flip_camera)
         self.voice_menu = Adw.ComboRow(title="Voice", model=Gtk.StringList.new(list(VOICES)))
         self.voice_menu.connect("notify::selected", self.on_voice)
         self.monitor = Adw.SwitchRow(title="Hear my voice", subtitle="Use headphones to avoid feedback")
         self.monitor.connect("notify::active", self.on_monitor)
+        self.dark = Adw.SwitchRow(title="Dark mode", active=True)
+        self.dark.connect("notify::active", self.on_dark)
+
+        self.sound_search = Gtk.SearchEntry(placeholder_text="Search sounds", margin_bottom=8)
+        self.sound_search.connect("search-changed", lambda _: self.sound_buttons.invalidate_filter())
         self.sound_buttons = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, min_children_per_line=2,
                                          max_children_per_line=3, column_spacing=6, row_spacing=6, margin_bottom=12)
+        self.sound_buttons.set_filter_func(
+            lambda child: self.sound_search.get_text().lower() in child.get_child().get_tooltip_text().lower())
         self.volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
         self.volume.set_value(0.7)  # meme clips are often mastered very loud
         self.volume.set_hexpand(True)
         self.volume.update_property([Gtk.AccessibleProperty.LABEL], ["Sound volume"])
         volume_row = Adw.ActionRow(title="Volume")
         volume_row.add_suffix(self.volume)
-        self.sound_group = Adw.PreferencesGroup(title="Soundboard", description="Plays through the mic. Add your own clips with +.")
+        self.sound_group = Adw.PreferencesGroup(title="Soundboard",
+                                                description="Plays through the mic. Press + or drag clips here.")
         actions = Gtk.Box(spacing=6)
-        for icon, label, handler in (("list-add-symbolic", "Add sounds", self.on_add_sounds),
-                                     ("folder-open-symbolic", "Open sounds folder", self.on_open_sounds),
-                                     ("media-playback-stop-symbolic", "Stop sounds", self.on_stop_sounds)):
-            button = Gtk.Button(icon_name=icon, tooltip_text=label, css_classes=["flat"], valign=Gtk.Align.CENTER)
+        for icon, label, handler in (("add", "Add sounds", self.on_add_sounds), ("folder", "Open sounds folder", self.on_open_sounds),
+                                     ("stop", "Stop sounds", self.on_stop_sounds)):
+            button = Gtk.Button(icon_name=ICONS[icon], tooltip_text=label, css_classes=["flat"], valign=Gtk.Align.CENTER)
             button.update_property([Gtk.AccessibleProperty.LABEL], [label])
             button.connect("clicked", handler)
             actions.append(button)
         self.sound_group.set_header_suffix(actions)
-        self.sound_group.add(self.sound_buttons)
-        self.sound_group.add(volume_row)
+        volume_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+        volume_list.append(volume_row)
+        for widget in (self.sound_search, self.sound_buttons, volume_list):
+            self.sound_group.add(widget)
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("drop", lambda _target, files, _x, _y: self.add_sounds(files.get_files()) or True)
+        self.sound_group.add_controller(drop)
         self.load_sounds()
         window.connect("notify::is-active", lambda w, _: w.is_active() and self.load_sounds())  # picks up folder edits
-        self.dark = Adw.SwitchRow(title="Dark mode", active=True)
-        self.dark.connect("notify::active", self.on_dark)
 
+        for row, icon in ((self.look_menu, "look"), (self.mirror, "mirror"), (self.flip_camera, "flip"), (self.voice_menu, "voice"),
+                          (self.monitor, "monitor"), (volume_row, "volume"), (self.dark, "dark")):
+            row.add_prefix(Gtk.Image(icon_name=ICONS[icon]))
         settings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_start=8, margin_end=16, margin_top=8, margin_bottom=8)
         for title, description, rows in (
             ("Camera", "In Discord, choose the virtual camera.", (self.look_menu, self.mirror, self.flip_camera)),
@@ -1090,10 +1187,10 @@ class RedbarnStudio(Adw.Application):
             self.camera_group = self.camera_group if title != "Camera" else group
             if title == "Voice":
                 settings.append(self.sound_group)
-        panel = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True, width_request=340, child=settings)
+        panel = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True, width_request=360, child=settings)
 
         body = Gtk.Box()
-        body.append(stage)
+        body.append(self.stage)
         body.append(panel)
         view = Adw.ToolbarView(content=body)
         view.add_top_bar(header)
@@ -1108,6 +1205,113 @@ class RedbarnStudio(Adw.Application):
         if not self.sound_output:
             self.sound_group.set_sensitive(False)
             self.sound_group.set_description("Needs the virtual mic: see the message at the top.")
+        first_run = not os.path.exists(SETTINGS_FILE)
+        self.apply_settings(load_settings())
+        if first_run:
+            GLib.idle_add(lambda: self.show_help() and False)
+
+    def apply_settings(self, saved):
+        # Checked one by one: the file is hand-editable, so any value may be missing or the wrong type.
+        if isinstance(saved.get("look"), str) and saved["look"] in LOOKS:
+            self.look_menu.set_selected(LOOKS.index(saved["look"]))
+        if isinstance(saved.get("voice"), str) and saved["voice"] in VOICES:
+            self.voice_menu.set_selected(list(VOICES).index(saved["voice"]))
+        for key, row in (("mirror", self.mirror), ("flip", self.flip_camera), ("dark", self.dark)):
+            if isinstance(saved.get(key), bool):
+                row.set_active(saved[key])
+        if isinstance(saved.get("volume"), (int, float)):
+            self.volume.set_value(saved["volume"])
+
+    def current_settings(self):
+        return {"look": self.look, "voice": list(VOICES)[self.voice_menu.get_selected()], "mirror": self.mirror.get_active(),
+                "flip": self.flip_camera.get_active(), "dark": self.dark.get_active(), "volume": round(self.volume.get_value(), 2)}
+
+    def quit_app(self):
+        window = self.get_active_window()
+        while dialog := window.get_visible_dialog():  # an open dialog swallows the window's close request
+            dialog.force_close()
+        window.close()
+
+    def open_uri(self, uri):
+        Gtk.UriLauncher(uri=uri).launch(self.get_active_window(), None, None)
+
+    def report_problem(self):
+        self.open_uri(f"{REPO_URL}/issues/new")
+
+    def show_about(self):
+        about = Adw.AboutDialog(application_name=APP_NAME, application_icon=APP_ID, version=VERSION,
+                                developer_name="Redbarn Christian Co.", copyright=COPYRIGHT, license_type=Gtk.License.GPL_3_0,
+                                website=REPO_URL, issue_url=f"{REPO_URL}/issues",
+                                comments="Cinematic camera looks, voice filters and a soundboard for Discord.")
+        about.add_acknowledgement_section("Built with", [
+            "GStreamer https://gstreamer.freedesktop.org", "GTK https://gtk.org",
+            "libadwaita https://gnome.pages.gitlab.gnome.org/libadwaita/", "Rubber Band Library https://breakfastquay.com/rubberband/"])
+        about.present(self.get_active_window())
+
+    def show_help(self):
+        dialog = Adw.PreferencesDialog(title="Setup & Help", search_enabled=False)
+        page = Adw.PreferencesPage()
+        dialog.add(page)
+        check_again = Gtk.Button(label="Check Again", css_classes=["flat"], valign=Gtk.Align.CENTER)
+        checks = Adw.PreferencesGroup(title="Setup check", description="Everything Redbarn Studio needs on this computer.",
+                                      header_suffix=check_again)
+        check_again.connect("clicked", lambda _: self.fill_checks(dialog, checks))
+        self.fill_checks(dialog, checks)
+        page.add(checks)
+
+        loopback = find_loopback()
+        camera = loopback[1] if loopback else "the virtual camera"
+        for title, rows in (
+            ("Use it in Discord", (
+                "1. In Discord, open Settings, then Voice &amp; Video.",
+                f"2. Under Camera, choose “{GLib.markup_escape_text(camera)}”.",
+                f"3. Under Input Device, choose “{MIC_NAME}”.",
+                f"4. Keep {APP_NAME} open while you’re in a call.")),
+            ("Tips", (
+                "Use headphones with Hear my voice, or your mic will pick up its own output.",
+                "If people see the overlay text backwards, turn off Mirror overlay text. "
+                "Discord mirrors your own view of your camera, so it can look backwards only to you.",
+                "If a voice sounds wrong or sounds get cut off, turn off Discord’s noise suppression.",
+                "To remove one of your own sounds, right-click it, or press and hold it.")),
+        ):
+            group = Adw.PreferencesGroup(title=title)
+            for text in rows:
+                group.add(Adw.ActionRow(title=text, title_lines=0))
+            page.add(group)
+
+        more = Adw.PreferencesGroup(title="More help")
+        for title, uri in (("Online guide", f"{REPO_URL}#readme"), ("Report a problem", f"{REPO_URL}/issues/new")):
+            row = Adw.ActionRow(title=title, activatable=True)
+            row.add_prefix(Gtk.Image(icon_name=ICONS["link"]))
+            row.connect("activated", lambda _, uri=uri: self.open_uri(uri))
+            more.add(row)
+        page.add(more)
+        dialog.present(self.get_active_window())
+        return dialog
+
+    def fill_checks(self, dialog, group):
+        for row in getattr(group, "rows", []):
+            group.remove(row)
+        group.rows = []
+        for ok, what, effect, package in requirements():
+            fix = fix_text(package) if package and not ok else ""
+            subtitle = "Ready" if ok else f"Without it {effect}." + (f"\n{fix}" if fix else "")
+            row = Adw.ActionRow(title=GLib.markup_escape_text(what), subtitle=GLib.markup_escape_text(subtitle),
+                                subtitle_selectable=True, subtitle_lines=0)
+            row.add_prefix(Gtk.Image(icon_name=ICONS["ok" if ok else "warning"], css_classes=["success" if ok else "warning"]))
+            if fix and WINDOWS:
+                button = Gtk.Button(label="Download", css_classes=["flat"], valign=Gtk.Align.CENTER)
+                button.connect("clicked", lambda _, uri=WINDOWS_DOWNLOADS[package]: self.open_uri(uri))
+                row.add_suffix(button)
+            elif fix and "\n" not in fix:
+                button = Gtk.Button(icon_name=ICONS["copy"], tooltip_text="Copy the command", css_classes=["flat"], valign=Gtk.Align.CENTER)
+                button.update_property([Gtk.AccessibleProperty.LABEL], ["Copy the command"])
+                command = fix.split("  (")[0]  # drop notes like "(from RPM Fusion)", which aren't part of the command
+                button.connect("clicked", lambda _, command=command: (
+                    dialog.get_clipboard().set(command), dialog.add_toast(Adw.Toast(title="Copied. Paste it into a terminal."))))
+                row.add_suffix(button)
+            group.add(row)
+            group.rows.append(row)
 
     def set_status(self, pill, level, text, problem=None):
         pill.set_text(f"● {text}")
@@ -1118,15 +1322,28 @@ class RedbarnStudio(Adw.Application):
         self.banner.set_revealed(bool(problems))
 
     def camera_off(self, reason):
-        self.set_status(self.status, "stopped", "Camera off", reason)
+        # Shown on the camera-off screen, so not repeated in the banner.
+        self.set_status(self.status, "stopped", "Camera off")
+        self.camera_off_page.set_description(GLib.markup_escape_text(reason))
+        self.stage.set_visible_child_name("off")
+
+    def stop_camera(self):
+        if not self.pipeline:
+            return
+        self.pipeline.get_bus().remove_signal_watch()
+        stop(self.pipeline)
+        if getattr(self.pipeline, "virtual_camera", None):
+            self.pipeline.virtual_camera.close()
+        self.pipeline = None
 
     def start(self):
+        self.stop_camera()  # Try Again after an error: the old pipeline still holds the devices
         cam, loopback = find_webcam(), find_loopback()
         if not cam:
-            self.camera_off(f"No webcam found. Plug it in, then reopen {APP_NAME}.")
+            self.camera_off("No webcam found. Plug it in, then click Try Again.")
             return
         if not loopback:
-            self.camera_off("Virtual camera not found. Run redbarn-studio --check for setup help.")
+            self.camera_off("The virtual camera isn't set up. Setup & Help shows how to add it.")
             return
         loopback_path, loopback_name = loopback
         self.camera_group.set_description(f"In Discord, choose “{GLib.markup_escape_text(loopback_name)}”.")
@@ -1143,7 +1360,9 @@ class RedbarnStudio(Adw.Application):
         bus.add_signal_watch()
         bus.connect("message::error", self.on_error)
         self.pipeline.set_state(Gst.State.PLAYING)
-        GLib.timeout_add(500, self.tick)
+        if not self.ticking:  # one timer for the app's life: a second would make the dot blink twice as fast
+            self.ticking = GLib.timeout_add(500, self.tick)
+        self.stage.set_visible_child_name("live")
         self.set_status(self.status, "live", "Camera live")
 
     def start_voice(self):
@@ -1209,7 +1428,8 @@ class RedbarnStudio(Adw.Application):
 
     def tick(self):
         self.blink = not self.blink
-        set_overlay(self.pipeline, self.look, self.blink)
+        if self.pipeline:
+            set_overlay(self.pipeline, self.look, self.blink)
         return True
 
     def on_look(self, menu, _param):
@@ -1247,7 +1467,29 @@ class RedbarnStudio(Adw.Application):
         for name, path in [(name, None) for name in SOUNDS] + [(os.path.splitext(os.path.basename(f))[0], f) for f in files]:
             button = Gtk.Button(child=Gtk.Label(label=name, ellipsize=Pango.EllipsizeMode.END, max_width_chars=12), tooltip_text=name)
             button.connect("clicked", self.on_sound, name, path)
+            if path:  # built-in sounds can't be removed
+                for gesture in (Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY), Gtk.GestureLongPress()):
+                    gesture.connect("pressed", lambda *_, button=button, path=path: self.offer_remove(button, path))
+                    button.add_controller(gesture)
             self.sound_buttons.append(button)
+
+    def offer_remove(self, button, path):
+        remove = Gtk.Button(label="Remove", css_classes=["flat", "destructive-action"])
+        popover = Gtk.Popover(child=remove)
+        popover.set_parent(button)
+        popover.connect("closed", lambda _: GLib.idle_add(popover.unparent))  # the button may be rebuilt, so let go of it
+        remove.connect("clicked", lambda _: (popover.popdown(), self.remove_sound(path)))
+        popover.popup()
+
+    def remove_sound(self, path):
+        name = os.path.splitext(os.path.basename(path))[0]
+        try:
+            Gio.File.new_for_path(path).trash(None)  # not deleted: it can be restored
+        except GLib.Error as e:
+            self.toasts.add_toast(Adw.Toast(title=f"Couldn't remove {name}: {e.message}"))
+            return
+        self.toasts.add_toast(Adw.Toast(title=f"Moved {name} to the {'Recycle Bin' if WINDOWS else 'Trash'}"))
+        self.load_sounds()
 
     def on_sound(self, _button, name, path):
         try:
@@ -1291,12 +1533,21 @@ class RedbarnStudio(Adw.Application):
             files = dialog.open_multiple_finish(result)
         except GLib.Error:
             return  # cancelled
+        self.add_sounds(files)
+
+    def add_sounds(self, files):
+        skipped = []
         try:
             os.makedirs(SOUNDS_DIR, exist_ok=True)
             for file in files:
-                shutil.copy(file.get_path(), SOUNDS_DIR)
+                if file.get_basename().lower().endswith(SOUND_TYPES):
+                    shutil.copy(file.get_path(), SOUNDS_DIR)
+                else:
+                    skipped.append(file.get_basename())
         except (OSError, TypeError) as e:  # TypeError: a file with no local path
             self.toasts.add_toast(Adw.Toast(title=f"Couldn't add that sound: {e}"))
+        if skipped:
+            self.toasts.add_toast(Adw.Toast(title=f"Skipped {', '.join(skipped)}: only MP3, WAV, OGG and Opus files can be added"))
         self.load_sounds()
 
     def on_open_sounds(self, _button):
@@ -1322,12 +1573,15 @@ class RedbarnStudio(Adw.Application):
         self.voice_pipeline = None
 
     def on_close(self, _window):
+        try:
+            save_settings(self.current_settings())
+        except OSError as e:
+            print(f"Couldn't save settings: {e}", file=sys.stderr)
         self.on_stop_sounds(None)
-        for handle in (self.pipeline, self.voice_pipeline, self.monitor_process, self.virtual_mic):
+        self.stop_camera()
+        for handle in (self.voice_pipeline, self.monitor_process, self.virtual_mic):
             if handle:
                 stop(handle)
-        if getattr(self.pipeline, "virtual_camera", None):
-            self.pipeline.virtual_camera.close()
         return False
 
 
@@ -1575,6 +1829,36 @@ def check_sounds():
                 assert first > last * 1.1, "Sad Trombone doesn't fall"
             if name == "Ding":
                 assert abs(tone_frequency(samples[:RATE // 2]) - 880) < 20, "Ding is at the wrong pitch"
+            if name == "Ba-Dum-Tss":
+                drum, tss = tone_frequency(samples[:RATE // 8]), tone_frequency(samples[int(0.8 * RATE):int(1.2 * RATE)])
+                print(f"Ba-Dum-Tss crossings: drum {drum:.0f}/s, cymbal {tss:.0f}/s")
+                assert tss > 3 * drum, "Ba-Dum-Tss has no bright cymbal after the drums"
+
+
+def check_settings():
+    global SETTINGS_FILE
+    with tempfile.TemporaryDirectory() as folder:
+        SETTINGS_FILE = os.path.join(folder, "settings.json")
+        assert load_settings() == {}, "missing settings should load as defaults"
+        saved = {"look": "VHS", "voice": "Robot", "mirror": False, "flip": True, "dark": False, "volume": 0.35}
+        save_settings(saved)
+        assert load_settings() == saved, "settings didn't survive a save and load"
+        with open(SETTINGS_FILE, "w") as f:
+            f.write('{"look": "VH')
+        assert load_settings() == {}, "a damaged settings file should load as defaults"
+
+
+def check_icons():
+    """Catches icons missing from the Windows bundle, which would show as broken images."""
+    if not Gtk.init_check():
+        print("No display: skipping the icon check")
+        return
+    Adw.init()
+    display = Gdk.Display.get_default()
+    add_app_icon(display)
+    theme = Gtk.IconTheme.get_for_display(display)
+    missing = [name for name in ICONS.values() if not theme.has_icon(name)]
+    assert not missing, f"icons missing from the icon theme: {missing}"
 
 
 def self_test():
@@ -1642,6 +1926,8 @@ def self_test():
     check_voices()
     check_formants()
     check_sounds()
+    check_settings()
+    check_icons()
     missing = [name for name in GST_ELEMENTS if not Gst.ElementFactory.find(name)]
     assert not missing, f"missing GStreamer elements: {missing}"
     print("self-test passed")
