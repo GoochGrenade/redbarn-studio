@@ -49,8 +49,8 @@ If something's wrong, open **Setup & Help** from the menu (or press F1) to see w
 
 ## Tips
 
-- Use headphones with **Hear my voice**, or your mic will pick up its own output.
-- If people on a call see the overlay text backwards, turn off **Mirror overlay text**. Discord mirrors your own view of your camera, so the text can look backwards only to you.
+- Use headphones with **Voice Playback**, or your mic will pick up its own output.
+- If people on a call see the overlay text backwards, turn off **Mirror Overlay Text**. Discord mirrors your own view of your camera, so the text can look backwards only to you.
 - If a voice sounds wrong in Discord, or the soundboard is cut off, try turning off Discord's noise suppression.
 
 ## Licence

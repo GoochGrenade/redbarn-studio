@@ -34,7 +34,7 @@ elif WINDOWS and sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the console's default code page can't print ✓
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 REPO_URL = "https://github.com/GoochGrenade/redbarn-studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
 MIC_NAME = "CABLE Output" if WINDOWS else "Redbarn Mic"  # what to pick in Discord
@@ -1132,15 +1132,15 @@ class RedbarnStudio(Adw.Application):
         self.look_menu = Adw.ComboRow(title="Look", model=Gtk.StringList.new(LOOKS))
         self.look_menu.connect("notify::selected", self.on_look)
         # Discord mirrors your own view of your camera, so correct text can look backwards to you alone.
-        self.mirror = Adw.SwitchRow(title="Mirror overlay text", subtitle="Turn off if viewers see it backwards", active=True)
+        self.mirror = Adw.SwitchRow(title="Mirror Overlay Text", subtitle="Turn off if viewers see it backwards", active=True)
         self.mirror.connect("notify::active", self.on_mirror)
-        self.flip_camera = Adw.SwitchRow(title="Flip camera", subtitle="Turn the picture upside down")
+        self.flip_camera = Adw.SwitchRow(title="Flip Camera", subtitle="Turn the picture upside down")
         self.flip_camera.connect("notify::active", self.on_flip_camera)
         self.voice_menu = Adw.ComboRow(title="Voice", model=Gtk.StringList.new(list(VOICES)))
         self.voice_menu.connect("notify::selected", self.on_voice)
-        self.monitor = Adw.SwitchRow(title="Hear my voice", subtitle="Use headphones to avoid feedback")
+        self.monitor = Adw.SwitchRow(title="Voice Playback", subtitle="Use headphones to avoid feedback")
         self.monitor.connect("notify::active", self.on_monitor)
-        self.dark = Adw.SwitchRow(title="Dark mode", active=True)
+        self.dark = Adw.SwitchRow(title="Dark Mode", active=True)
         self.dark.connect("notify::active", self.on_dark)
 
         self.sound_search = Gtk.SearchEntry(placeholder_text="Search sounds", margin_bottom=8)
@@ -1151,11 +1151,11 @@ class RedbarnStudio(Adw.Application):
             lambda child: self.sound_search.get_text().lower() in child.get_child().get_tooltip_text().lower())
         volume_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
         scales = []
-        for title, default, icon in (("Others hear", 0.6, "volume"), ("You hear", 0.75, "my_volume")):
+        for title, default, icon in (("Output Volume", 0.6, "volume"), ("Monitor Volume", 0.75, "my_volume")):
             scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
             scale.set_value(default)
             scale.set_size_request(130, -1)  # same length for both, whatever the label
-            scale.update_property([Gtk.AccessibleProperty.LABEL], [f"Sound volume: {title.lower()}"])
+            scale.update_property([Gtk.AccessibleProperty.LABEL], [f"Soundboard {title.lower()}"])
             row = Adw.ActionRow(title=title)
             row.add_prefix(Gtk.Image(icon_name=ICONS[icon]))
             row.add_suffix(scale)
@@ -1189,8 +1189,8 @@ class RedbarnStudio(Adw.Application):
             row.add_prefix(Gtk.Image(icon_name=ICONS[icon]))
         settings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_start=8, margin_end=16, margin_top=8, margin_bottom=8)
         for title, description, rows in (
-            ("Camera", "Pick the virtual camera in any app.", (self.look_menu, self.mirror, self.flip_camera)),
-            ("Voice", f"Pick {MIC_NAME} as the mic in any app.", (self.voice_menu, self.monitor)),
+            ("Camera", "Select the virtual camera as your camera source.", (self.look_menu, self.mirror, self.flip_camera)),
+            ("Voice", f"Select '{MIC_NAME}' in your voice chat settings.", (self.voice_menu, self.monitor)),
             ("Appearance", None, (self.dark,)),
         ):
             group = Adw.PreferencesGroup(title=title, description=description)
@@ -1285,8 +1285,8 @@ class RedbarnStudio(Adw.Application):
                 f"3. Under Input Device, choose “{MIC_NAME}”.",
                 f"4. Keep {APP_NAME} open while you’re in a call.")),
             ("Tips", (
-                "Use headphones with Hear my voice, or your mic will pick up its own output.",
-                "If people see the overlay text backwards, turn off Mirror overlay text. "
+                "Use headphones with Voice Playback, or your mic will pick up its own output.",
+                "If people see the overlay text backwards, turn off Mirror Overlay Text. "
                 "Discord mirrors your own view of your camera, so it can look backwards only to you.",
                 "If a voice sounds wrong or sounds get cut off, turn off Discord’s noise suppression.",
                 "To remove one of your own sounds, right-click it, or press and hold it.")),
@@ -1363,7 +1363,7 @@ class RedbarnStudio(Adw.Application):
             self.camera_off("The virtual camera isn't set up. Setup & Help shows how to add it.")
             return
         loopback_path, loopback_name = loopback
-        self.camera_group.set_description(f"Pick “{GLib.markup_escape_text(loopback_name)}” as the camera in any app.")
+        self.camera_group.set_description(f"Select '{GLib.markup_escape_text(loopback_name)}' as your camera source.")
         try:
             self.pipeline = build_camera_pipeline(cam, loopback_path)
         except GLib.Error as e:
@@ -1513,7 +1513,7 @@ class RedbarnStudio(Adw.Application):
     def on_sound(self, _button, name, path):
         try:
             path = path or builtin_sound(name)
-            # "Hear my voice" already plays the mic to the speakers: a second copy then would double it.
+            # Voice Playback already plays the mic to the speakers: a second copy then would double it.
             for device in (self.sound_output, *(() if self.monitor.get_active() else (None,))):
                 gain, scale = (SOUND_GAIN, self.volume) if device else (MY_SOUND_GAIN, self.my_volume)
                 # Cubic, like desktop volume controls: a linear slider is too loud for most of its travel.
