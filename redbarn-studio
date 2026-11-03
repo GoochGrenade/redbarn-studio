@@ -34,7 +34,7 @@ elif WINDOWS and sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the console's default code page can't print ✓
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 REPO_URL = "https://github.com/GoochGrenade/redbarn-studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
 MIC_NAME = "CABLE Output" if WINDOWS else "Redbarn Mic"  # what to pick in Discord
@@ -853,11 +853,13 @@ def build_voice_pipeline(mic, output):
 
 SOUND_TYPES = (".mp3", ".wav", ".ogg", ".opus")
 SOUND_GAIN = 0.4  # at full slider: clips are mastered far louder than a voice through a mic
+MY_SOUND_GAIN = 1.0  # your own copy: apps like Discord boost voices, so the mic level sounds faint on your speakers
 SETTINGS_FILE = os.path.join(GLib.get_user_config_dir(), "redbarn-studio", "settings.json")
 ICON_DIR = os.path.join(GLib.get_user_cache_dir(), "redbarn-studio", "icons")
 ICONS = {
     "look": "camera-photo-symbolic", "mirror": "view-mirror-symbolic", "flip": "object-flip-vertical-symbolic",
     "voice": "audio-input-microphone-symbolic", "monitor": "audio-headphones-symbolic", "volume": "audio-volume-high-symbolic",
+    "my_volume": "audio-speakers-symbolic",
     "dark": "weather-clear-night-symbolic", "add": "list-add-symbolic", "folder": "folder-open-symbolic",
     "stop": "media-playback-stop-symbolic", "menu": "open-menu-symbolic", "camera_off": "camera-disabled-symbolic",
     "ok": "object-select-symbolic", "warning": "dialog-warning-symbolic", "copy": "edit-copy-symbolic",
@@ -1147,12 +1149,20 @@ class RedbarnStudio(Adw.Application):
                                          max_children_per_line=3, column_spacing=6, row_spacing=6)
         self.sound_buttons.set_filter_func(
             lambda child: self.sound_search.get_text().lower() in child.get_child().get_tooltip_text().lower())
-        self.volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
-        self.volume.set_value(0.6)
-        self.volume.set_hexpand(True)
-        self.volume.update_property([Gtk.AccessibleProperty.LABEL], ["Sound volume"])
-        volume_row = Adw.ActionRow(title="Volume")
-        volume_row.add_suffix(self.volume)
+        volume_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+        scales = []
+        for title, default, icon in (("Others hear", 0.6, "volume"), ("You hear", 0.75, "my_volume")):
+            scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
+            scale.set_value(default)
+            scale.set_size_request(130, -1)  # same length for both, whatever the label
+            scale.update_property([Gtk.AccessibleProperty.LABEL], [f"Sound volume: {title.lower()}"])
+            row = Adw.ActionRow(title=title)
+            row.add_prefix(Gtk.Image(icon_name=ICONS[icon]))
+            row.add_suffix(scale)
+            volume_list.append(row)
+            scales.append(scale)
+        self.volume, self.my_volume = scales
+        self.my_volume_row = row
         self.sound_group = Adw.PreferencesGroup(title="Soundboard",
                                                 description="Plays through the mic. Press + or drag clips here.")
         actions = Gtk.Box(spacing=6)
@@ -1163,8 +1173,6 @@ class RedbarnStudio(Adw.Application):
             button.connect("clicked", handler)
             actions.append(button)
         self.sound_group.set_header_suffix(actions)
-        volume_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
-        volume_list.append(volume_row)
         # Grows with the sounds up to about four rows, then scrolls, so added clips can't take over the panel.
         sound_scroller = Gtk.ScrolledWindow(child=self.sound_buttons, hscrollbar_policy=Gtk.PolicyType.NEVER,
                                             propagate_natural_height=True, max_content_height=180, margin_bottom=12)
@@ -1177,7 +1185,7 @@ class RedbarnStudio(Adw.Application):
         window.connect("notify::is-active", lambda w, _: w.is_active() and self.load_sounds())  # picks up folder edits
 
         for row, icon in ((self.look_menu, "look"), (self.mirror, "mirror"), (self.flip_camera, "flip"), (self.voice_menu, "voice"),
-                          (self.monitor, "monitor"), (volume_row, "volume"), (self.dark, "dark")):
+                          (self.monitor, "monitor"), (self.dark, "dark")):
             row.add_prefix(Gtk.Image(icon_name=ICONS[icon]))
         settings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_start=8, margin_end=16, margin_top=8, margin_bottom=8)
         for title, description, rows in (
@@ -1227,10 +1235,13 @@ class RedbarnStudio(Adw.Application):
                 row.set_active(saved[key])
         if isinstance(saved.get("sound_level"), (int, float)):  # renamed in 1.1.1: older "volume" values used a louder scale
             self.volume.set_value(saved["sound_level"])
+        if isinstance(saved.get("my_sound_level"), (int, float)):
+            self.my_volume.set_value(saved["my_sound_level"])
 
     def current_settings(self):
         return {"look": self.look, "voice": list(VOICES)[self.voice_menu.get_selected()], "mirror": self.mirror.get_active(),
-                "flip": self.flip_camera.get_active(), "dark": self.dark.get_active(), "sound_level": round(self.volume.get_value(), 2)}
+                "flip": self.flip_camera.get_active(), "dark": self.dark.get_active(), "sound_level": round(self.volume.get_value(), 2),
+                "my_sound_level": round(self.my_volume.get_value(), 2)}
 
     def quit_app(self):
         window = self.get_active_window()
@@ -1458,6 +1469,8 @@ class RedbarnStudio(Adw.Application):
             set_camera_flipped(self.pipeline, row.get_active())
 
     def on_monitor(self, row, _param):
+        # With it on you hear the mic, sounds included, so your own copy and its slider aren't used.
+        self.my_volume_row.set_sensitive(not row.get_active())
         if row.get_active():
             self.monitor_process = start_monitor()
         elif self.monitor_process:
@@ -1502,8 +1515,9 @@ class RedbarnStudio(Adw.Application):
             path = path or builtin_sound(name)
             # "Hear my voice" already plays the mic to the speakers: a second copy then would double it.
             for device in (self.sound_output, *(() if self.monitor.get_active() else (None,))):
+                gain, scale = (SOUND_GAIN, self.volume) if device else (MY_SOUND_GAIN, self.my_volume)
                 # Cubic, like desktop volume controls: a linear slider is too loud for most of its travel.
-                player = play_sound(path, SOUND_SINK, SOUND_GAIN * self.volume.get_value() ** 3, device)
+                player = play_sound(path, SOUND_SINK, gain * scale.get_value() ** 3, device)
                 bus = player.get_bus()
                 bus.add_signal_watch()
                 bus.connect("message", self.on_sound_message, player, name, device)
@@ -1847,7 +1861,7 @@ def check_settings():
     with tempfile.TemporaryDirectory() as folder:
         SETTINGS_FILE = os.path.join(folder, "settings.json")
         assert load_settings() == {}, "missing settings should load as defaults"
-        saved = {"look": "VHS", "voice": "Robot", "mirror": False, "flip": True, "dark": False, "sound_level": 0.35}
+        saved = {"look": "VHS", "voice": "Robot", "mirror": False, "flip": True, "dark": False, "sound_level": 0.35, "my_sound_level": 0.8}
         save_settings(saved)
         assert load_settings() == saved, "settings didn't survive a save and load"
         with open(SETTINGS_FILE, "w") as f:
