@@ -6,9 +6,9 @@ Cinematic camera looks and voice filters for Discord. Pick a look and a voice, a
 
 **13 voices:** Normal, Deep, Chipmunk, Child, Female, Male, Robot, Walkie-Talkie, Cave, Demon, Alien, Ghost and Ghostface.
 
-**Soundboard:** six original sounds (Air Horn, Ba-Dum-Tss, Sad Trombone, Buzzer, Ding and Crickets), plus any MP3, WAV or OGG clips you add with the **+** button. Sounds play through the mic, so Discord hears them, and you hear them too. Redbarn Studio doesn't include game or meme sounds, because they belong to their owners. You can download clips yourself, for example from [myinstants.com](https://www.myinstants.com), and add them.
+**Soundboard:** six original sounds (Air Horn, Ba-Dum-Tss, Sad Trombone, Buzzer, Ding and Crickets), plus any MP3, WAV or OGG clips you add with the **+** button or by dragging them onto the soundboard. Search finds a sound quickly, and right-clicking one of your own clips removes it. Sounds play through the mic, so Discord hears them, and you hear them too. Redbarn Studio doesn't include game or meme sounds, because they belong to their owners. You can download clips yourself, for example from [myinstants.com](https://www.myinstants.com), and add them.
 
-You can also hear your own filtered voice, mirror the overlay text, flip the camera and switch between dark and light mode.
+You can also hear your own filtered voice, mirror the overlay text, flip the camera and switch between dark and light mode. Redbarn Studio remembers your settings, and **Setup & Help** in the menu (or F1) checks your computer and shows how to fix anything that's missing.
 
 ## Linux
 
@@ -30,13 +30,13 @@ Needs PipeWire, a webcam and a microphone.
 
 | Command | What it does |
 |---|---|
-| `redbarn-studio --check` | Shows what's installed and what's missing |
+| `redbarn-studio --check` | Shows what's installed and what's missing (also in the app, under **Setup & Help**) |
 | `redbarn-studio --self-test` | Checks every look and voice on test signals, without your webcam or mic |
 | `redbarn-studio --uninstall` | Removes it from your app menu |
 
 ## Windows
 
-**[Download Redbarn Studio for Windows](https://github.com/GoochGrenade/redbarn-studio/releases/download/v1.0.0-beta/Redbarn-Studio-Windows.zip)** (beta, 175 MB)
+**[Download Redbarn Studio for Windows](https://github.com/GoochGrenade/redbarn-studio/releases/download/v1.1.0-beta/Redbarn-Studio-Windows.zip)** (beta, 176 MB)
 
 This is a beta: it passes all automated tests on a Windows build server, but hasn't been tested on a real Windows PC yet.
 
@@ -45,7 +45,7 @@ This is a beta: it passes all automated tests on a Windows build server, but has
 3. Unzip the download and open **Redbarn Studio.exe**. If Windows warns that it's from an unknown publisher, click **More info**, then **Run anyway**.
 4. In Discord, under **Settings > Voice & Video**, choose **OBS Virtual Camera** and **CABLE Output**. Keep Redbarn Studio open while you use them.
 
-If something's wrong, run `"Redbarn Studio.exe" --check` in a terminal in the unzipped folder to see what's missing. See the [release notes](https://github.com/GoochGrenade/redbarn-studio/releases/tag/v1.0.0-beta) for more help.
+If something's wrong, open **Setup & Help** from the menu (or press F1) to see what's missing, with download links. See the [release notes](https://github.com/GoochGrenade/redbarn-studio/releases/tag/v1.1.0-beta) for more help.
 
 ## Tips
 
