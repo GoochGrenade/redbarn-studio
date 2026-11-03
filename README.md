@@ -6,6 +6,8 @@ Cinematic camera looks and voice filters for Discord. Pick a look and a voice, a
 
 **13 voices:** Normal, Deep, Chipmunk, Child, Female, Male, Robot, Walkie-Talkie, Cave, Demon, Alien, Ghost and Ghostface.
 
+**Soundboard:** six original sounds (Air Horn, Ba-Dum-Tss, Sad Trombone, Buzzer, Ding and Crickets), plus any MP3, WAV or OGG clips you add with the **+** button. Sounds play through the mic, so Discord hears them, and you hear them too. Redbarn Studio doesn't include game or meme sounds, because they belong to their owners. You can download clips yourself, for example from [myinstants.com](https://www.myinstants.com), and add them.
+
 You can also hear your own filtered voice, mirror the overlay text, flip the camera and switch between dark and light mode.
 
 ## Linux
@@ -49,7 +51,7 @@ If something's wrong, run `"Redbarn Studio.exe" --check` in a terminal in the un
 
 - Use headphones with **Hear my voice**, or your mic will pick up its own output.
 - If people on a call see the overlay text backwards, turn off **Mirror overlay text**. Discord mirrors your own view of your camera, so the text can look backwards only to you.
-- If a voice sounds wrong in Discord, try turning off Discord's noise suppression.
+- If a voice sounds wrong in Discord, or the soundboard is cut off, try turning off Discord's noise suppression.
 
 ## Licence
 

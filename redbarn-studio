@@ -8,17 +8,21 @@
   redbarn-studio --uninstall   remove it from your app menu
   redbarn-studio --self-test   check the filters on a synthetic source (no webcam)
 """
+import array
 import ctypes
 import ctypes.util
 import glob
 import math
 import os
+import random
 import shutil
 import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import time
+import wave
 from datetime import datetime
 
 WINDOWS = sys.platform == "win32"
@@ -42,7 +46,8 @@ WINDOWS_HELP = {
 CABLE_INPUT = ("CABLE Input", "VB-Audio Virtual Cable")
 LOOPBACK_SETUP = 'sudo modprobe v4l2loopback exclusive_caps=1 card_label="Redbarn Camera"'
 GST_ELEMENTS = (*(("mfvideosrc", "decodebin", "wasapi2src", "wasapi2sink") if WINDOWS else ("v4l2src", "v4l2sink", "pulsesrc", "pulsesink")), "jpegdec", "glupload", "glshader", "gldownload", "textoverlay", "videoflip",
-                "appsrc", "appsink", "audiocheblimit", "audioecho", "audioamplify", "freeverb")
+                "appsrc", "appsink", "audiocheblimit", "audioecho", "audioamplify", "freeverb",
+                "playbin", "wavparse", "mpg123audiodec", "vorbisdec")
 PACKAGES = {  # (Fedora, Ubuntu/Debian)
     "ui": ("python3-gobject gtk4 libadwaita", "python3-gi gir1.2-gtk-4.0 gir1.2-adw-1"),
     "gst": ("gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free",
@@ -300,7 +305,8 @@ try:
     gi.require_version("GstApp", "1.0")
     gi.require_version("GstGL", "1.0")
     gi.require_version("Gtk", "4.0")
-    from gi.repository import Adw, Gdk, GLib, Gst, GstApp, GstGL, Gtk
+    gi.require_version("Pango", "1.0")
+    from gi.repository import Adw, Gdk, Gio, GLib, Gst, GstApp, GstGL, Gtk, Pango
 except (ImportError, ValueError):
     if __name__ != "__main__":
         raise
@@ -663,10 +669,12 @@ if WINDOWS:
     MIC_SOURCE = "wasapi2src name=mic low-latency=true"
     # Shared-mode WASAPI only takes the device's own sample rate, which can be 44.1kHz.
     VOICE_SINK = "audioresample ! audioconvert ! wasapi2sink name=voice_out low-latency=true sync=false"
+    SOUND_SINK = "audioconvert ! audioresample ! wasapi2sink name=out low-latency=true"
 else:
     WEBCAM_SOURCE, WEBCAM_DEVICE = "v4l2src name=cam ! image/jpeg,width=1280,height=720,framerate=30/1 ! jpegdec", "device"
     MIC_SOURCE = "pulsesrc name=mic buffer-time=40000 latency-time=10000"
     VOICE_SINK = "pulsesink name=voice_out buffer-time=40000 latency-time=10000 sync=false"
+    SOUND_SINK = "audioconvert ! audioresample ! pulsesink name=out"
 # Separate process: a playback fault must never reach what Discord receives.
 MONITOR_CMD = ["pw-loopback", "--name=redbarn-monitor", f"--capture={MIC_NODE}"]
 MIC_PROPS = "node.dont-fallback=true priority.session=1 priority.driver=1 audio.position=[FL FR]"
@@ -825,6 +833,89 @@ def build_voice_pipeline(mic, output):
     return pipeline
 
 
+SOUND_TYPES = (".mp3", ".wav", ".ogg", ".opus")
+SOUNDS_DIR = os.path.join(GLib.get_user_data_dir(), "redbarn-studio", "sounds")
+# Versioned: bump it when a recipe changes, or old copies would keep playing.
+BUILTIN_DIR = os.path.join(GLib.get_user_cache_dir(), "redbarn-studio", "sounds-1")
+RATE = 48000
+BRASS = {1: 1.0, 2: 0.5, 3: 0.35, 4: 0.2, 5: 0.1}
+
+
+def note(freq, seconds, partials={1: 1.0}, decay=0.0, glide=0.0, vibrato=0.0):
+    """A tone with the given partials ({frequency ratio: level}), fading in and out over 10ms to avoid clicks."""
+    samples, phase, count = [], 0.0, int(seconds * RATE)
+    for i in range(count):
+        t = i / RATE
+        phase += 2 * math.pi * freq * (1 - glide * t / seconds) * (1 + vibrato * math.sin(2 * math.pi * 5 * t)) / RATE
+        level = math.exp(-decay * t) * min(1, i / 480, (count - i) / 480)
+        samples.append(level * sum(amount * math.sin(ratio * phase) for ratio, amount in partials.items()))
+    return samples
+
+
+def hiss(seconds, decay):
+    noise = [random.uniform(-1, 1) for _ in range(int(seconds * RATE) + 1)]
+    return [(b - a) * 0.5 * math.exp(-decay * i / RATE) for i, (a, b) in enumerate(zip(noise, noise[1:]))]  # differences: high-pass
+
+
+def horn(seconds):
+    return [math.tanh(2.5 * (a + b)) for a, b in zip(note(466, seconds, BRASS), note(587, seconds, BRASS))]
+
+
+# Original sounds, made here: each is a list of (start in seconds, samples).
+SOUNDS = {
+    "Air Horn": lambda: [(start, horn(length)) for start, length in ((0, 0.12), (0.17, 0.12), (0.34, 0.7))],
+    "Ba-Dum-Tss": lambda: [(0, note(180, 0.25, decay=12, glide=0.5)), (0.2, note(140, 0.25, decay=12, glide=0.5)),
+                           (0.45, hiss(1.0, 5))],
+    "Sad Trombone": lambda: [(i * 0.45, note(freq, 1.3 if i == 3 else 0.42, BRASS, vibrato=0.03 if i == 3 else 0))
+                             for i, freq in enumerate((293.7, 277.2, 261.6, 246.9))],
+    "Buzzer": lambda: [(0, note(110, 0.8, {1: 1.0, 3: 0.33, 5: 0.2, 7: 0.14}))],
+    "Ding": lambda: [(0, note(880, 1.6, {1: 1.0, 2.76: 0.2, 5.4: 0.05}, decay=3))],
+    "Crickets": lambda: [(group * 0.55 + pulse * 0.04, note(4500, 0.02)) for group in range(4) for pulse in range(3)],
+}
+
+
+def builtin_sound(name):
+    """Path to the built-in sound's WAV file, made on first use."""
+    path = os.path.join(BUILTIN_DIR, f"{name}.wav")
+    if os.path.exists(path):
+        return path
+    parts = SOUNDS[name]()
+    mix = [0.0] * max(int(start * RATE) + len(samples) for start, samples in parts)
+    for start, samples in parts:
+        for i, x in enumerate(samples, int(start * RATE)):
+            mix[i] += x
+    scale = 0.9 / max(abs(x) for x in mix)
+    os.makedirs(BUILTIN_DIR, exist_ok=True)
+    with wave.open(path + ".part", "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(RATE)
+        out.writeframes(array.array("h", (int(x * scale * 32767) for x in mix)).tobytes())  # little-endian on x86
+    os.replace(path + ".part", path)
+    return path
+
+
+def user_sounds():
+    try:
+        names = sorted(os.listdir(SOUNDS_DIR), key=str.lower)
+    except FileNotFoundError:
+        return []
+    return [os.path.join(SOUNDS_DIR, name) for name in names if name.lower().endswith(SOUND_TYPES)]
+
+
+def play_sound(path, sink, volume, device=None):
+    player = Gst.ElementFactory.make("playbin")
+    Gst.util_set_object_arg(player, "flags", "audio")  # an MP3's cover art would otherwise open a video window
+    player.set_property("uri", Gst.filename_to_uri(path))
+    output = Gst.parse_bin_from_description(sink, True)
+    if device:
+        output.get_by_name("out").set_property("device", device)
+    player.set_property("audio-sink", output)
+    player.set_property("volume", volume)
+    player.set_state(Gst.State.PLAYING)
+    return player
+
+
 def set_look(fx, name):
     uniforms = f"uniforms, mode=(float){LOOKS.index(name)}.0"
     fx.set_property("uniforms", Gst.Structure.new_from_string(uniforms))
@@ -912,6 +1003,9 @@ class RedbarnStudio(Adw.Application):
         self.blink = True
         self.problems = {}
         self.camera_group = None
+        self.sound_output = None
+        self.sounds = []
+        self.sound_files = None
 
     def do_activate(self):
         # Reopening from the launcher lands here: starting again would kill the live stream.
@@ -958,6 +1052,28 @@ class RedbarnStudio(Adw.Application):
         self.voice_menu.connect("notify::selected", self.on_voice)
         self.monitor = Adw.SwitchRow(title="Hear my voice", subtitle="Use headphones to avoid feedback")
         self.monitor.connect("notify::active", self.on_monitor)
+        self.sound_buttons = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, min_children_per_line=2,
+                                         max_children_per_line=3, column_spacing=6, row_spacing=6, margin_bottom=12)
+        self.volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
+        self.volume.set_value(0.7)  # meme clips are often mastered very loud
+        self.volume.set_hexpand(True)
+        self.volume.update_property([Gtk.AccessibleProperty.LABEL], ["Sound volume"])
+        volume_row = Adw.ActionRow(title="Volume")
+        volume_row.add_suffix(self.volume)
+        self.sound_group = Adw.PreferencesGroup(title="Soundboard", description="Plays through the mic. Add your own clips with +.")
+        actions = Gtk.Box(spacing=6)
+        for icon, label, handler in (("list-add-symbolic", "Add sounds", self.on_add_sounds),
+                                     ("folder-open-symbolic", "Open sounds folder", self.on_open_sounds),
+                                     ("media-playback-stop-symbolic", "Stop sounds", self.on_stop_sounds)):
+            button = Gtk.Button(icon_name=icon, tooltip_text=label, css_classes=["flat"], valign=Gtk.Align.CENTER)
+            button.update_property([Gtk.AccessibleProperty.LABEL], [label])
+            button.connect("clicked", handler)
+            actions.append(button)
+        self.sound_group.set_header_suffix(actions)
+        self.sound_group.add(self.sound_buttons)
+        self.sound_group.add(volume_row)
+        self.load_sounds()
+        window.connect("notify::is-active", lambda w, _: w.is_active() and self.load_sounds())  # picks up folder edits
         self.dark = Adw.SwitchRow(title="Dark mode", active=True)
         self.dark.connect("notify::active", self.on_dark)
 
@@ -972,6 +1088,8 @@ class RedbarnStudio(Adw.Application):
                 group.add(row)
             settings.append(group)
             self.camera_group = self.camera_group if title != "Camera" else group
+            if title == "Voice":
+                settings.append(self.sound_group)
         panel = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True, width_request=340, child=settings)
 
         body = Gtk.Box()
@@ -981,11 +1099,15 @@ class RedbarnStudio(Adw.Application):
         view.add_top_bar(header)
         view.add_top_bar(self.banner)
         view.add_bottom_bar(copyright_line)
-        window.set_content(view)
+        self.toasts = Adw.ToastOverlay(child=view)
+        window.set_content(self.toasts)
         window.connect("close-request", self.on_close)
         window.present()
         self.start()
         self.start_voice()
+        if not self.sound_output:
+            self.sound_group.set_sensitive(False)
+            self.sound_group.set_description("Needs the virtual mic: see the message at the top.")
 
     def set_status(self, pill, level, text, problem=None):
         pill.set_text(f"● {text}")
@@ -1036,6 +1158,7 @@ class RedbarnStudio(Adw.Application):
                 help_text = f" {WINDOWS_HELP['cable']}" if WINDOWS else ""
                 self.voice_off(f"Couldn't create the virtual mic, so voice filters are off.{help_text}")
                 return
+            self.sound_output = output
             self.voice_pipeline = build_voice_pipeline(mic, output)
         except (GLib.Error, OSError, subprocess.SubprocessError) as e:
             self.voice_off(f"Voice filters are off: {e}")
@@ -1115,6 +1238,71 @@ class RedbarnStudio(Adw.Application):
             stop(self.monitor_process)
             self.monitor_process = None
 
+    def load_sounds(self):
+        files = user_sounds()
+        if files == self.sound_files:
+            return
+        self.sound_files = files
+        self.sound_buttons.remove_all()
+        for name, path in [(name, None) for name in SOUNDS] + [(os.path.splitext(os.path.basename(f))[0], f) for f in files]:
+            button = Gtk.Button(child=Gtk.Label(label=name, ellipsize=Pango.EllipsizeMode.END, max_width_chars=12), tooltip_text=name)
+            button.connect("clicked", self.on_sound, name, path)
+            self.sound_buttons.append(button)
+
+    def on_sound(self, _button, name, path):
+        try:
+            path = path or builtin_sound(name)
+            # "Hear my voice" already plays the mic to the speakers: a second copy then would double it.
+            for device in (self.sound_output, *(() if self.monitor.get_active() else (None,))):
+                player = play_sound(path, SOUND_SINK, self.volume.get_value(), device)
+                bus = player.get_bus()
+                bus.add_signal_watch()
+                bus.connect("message", self.on_sound_message, player, name, device)
+                self.sounds.append(player)
+        except (GLib.Error, OSError) as e:
+            self.toasts.add_toast(Adw.Toast(title=f"Couldn't play {name}: {e}"))
+
+    def on_sound_message(self, bus, message, player, name, device):
+        if message.type not in (Gst.MessageType.EOS, Gst.MessageType.ERROR):
+            return
+        if message.type == Gst.MessageType.ERROR and device == self.sound_output:
+            self.toasts.add_toast(Adw.Toast(title=f"Couldn't play {name}: {message.parse_error()[0].message}"))
+        bus.remove_signal_watch()
+        self.stop_sound(player)
+
+    def stop_sound(self, player):
+        player.set_state(Gst.State.NULL)
+        if player in self.sounds:
+            self.sounds.remove(player)
+
+    def on_stop_sounds(self, _button):
+        for player in list(self.sounds):
+            player.get_bus().remove_signal_watch()
+            self.stop_sound(player)
+
+    def on_add_sounds(self, _button):
+        audio = Gtk.FileFilter(name="Sounds")
+        for suffix in SOUND_TYPES:
+            audio.add_suffix(suffix[1:])
+        Gtk.FileDialog(title="Add sounds", default_filter=audio).open_multiple(self.get_active_window(), None, self.on_sounds_chosen)
+
+    def on_sounds_chosen(self, dialog, result):
+        try:
+            files = dialog.open_multiple_finish(result)
+        except GLib.Error:
+            return  # cancelled
+        try:
+            os.makedirs(SOUNDS_DIR, exist_ok=True)
+            for file in files:
+                shutil.copy(file.get_path(), SOUNDS_DIR)
+        except (OSError, TypeError) as e:  # TypeError: a file with no local path
+            self.toasts.add_toast(Adw.Toast(title=f"Couldn't add that sound: {e}"))
+        self.load_sounds()
+
+    def on_open_sounds(self, _button):
+        os.makedirs(SOUNDS_DIR, exist_ok=True)
+        Gtk.FileLauncher(file=Gio.File.new_for_path(SOUNDS_DIR)).launch(self.get_active_window(), None, None)
+
     def on_dark(self, row, _param):
         dark = row.get_active()
         Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK if dark else Adw.ColorScheme.FORCE_LIGHT)
@@ -1134,6 +1322,7 @@ class RedbarnStudio(Adw.Application):
         self.voice_pipeline = None
 
     def on_close(self, _window):
+        self.on_stop_sounds(None)
         for handle in (self.pipeline, self.voice_pipeline, self.monitor_process, self.virtual_mic):
             if handle:
                 stop(handle)
@@ -1354,6 +1543,40 @@ def check_picture_not_mirrored():
     assert changed < 1, "mirroring the text altered the picture"
 
 
+def record_sound(path):
+    """All of a sound's samples, played the way the soundboard plays it but into an appsink."""
+    player = play_sound(path, "audioconvert ! audioresample ! audio/x-raw,format=F32LE,rate=48000,channels=1 "
+                              "! appsink name=out sync=false", 1.0)
+    sink, samples = player.get_property("audio-sink").get_by_name("out"), []
+    while sample := sink.emit("try-pull-sample", 5 * Gst.SECOND):
+        buffer = sample.get_buffer()
+        ok, info = buffer.map(Gst.MapFlags.READ)
+        assert ok, "couldn't read audio"
+        samples += struct.unpack(f"<{len(info.data) // 4}f", bytes(info.data))
+        buffer.unmap(info)
+    message = player.get_bus().pop_filtered(Gst.MessageType.ERROR)
+    player.set_state(Gst.State.NULL)
+    assert not message, message.parse_error()[0].message if message else ""
+    assert sink.get_property("eos"), f"{path} stalled"
+    return samples
+
+
+def check_sounds():
+    """Built-in sounds, through the soundboard's real player; writes only to a temporary folder."""
+    global BUILTIN_DIR
+    with tempfile.TemporaryDirectory() as BUILTIN_DIR:
+        for name in SOUNDS:
+            samples = record_sound(builtin_sound(name))
+            print(f"{name:13} {len(samples) / RATE:.2f}s, peak {peak(samples):.2f}")
+            assert 0.3 < len(samples) / RATE < 3 and peak(samples) > 0.5, f"{name} is silent or the wrong length"
+            if name == "Sad Trombone":
+                first, last = tone_frequency(samples[:RATE // 3]), tone_frequency(samples[int(1.4 * RATE):int(2.2 * RATE)])
+                print(f"Sad Trombone falls from {first:.0f}Hz to {last:.0f}Hz")
+                assert first > last * 1.1, "Sad Trombone doesn't fall"
+            if name == "Ding":
+                assert abs(tone_frequency(samples[:RATE // 2]) - 880) < 20, "Ding is at the wrong pitch"
+
+
 def self_test():
     """Asserts on pixels: both failures this guards against raise no GStreamer error."""
     # gradient is static and dark at the top: smpte has animated snow, which fakes moving grain.
@@ -1418,6 +1641,9 @@ def self_test():
     assert len(LOOKS) == len(VOICES), "Looks and voices should stay equal in number"
     check_voices()
     check_formants()
+    check_sounds()
+    missing = [name for name in GST_ELEMENTS if not Gst.ElementFactory.find(name)]
+    assert not missing, f"missing GStreamer elements: {missing}"
     print("self-test passed")
 
 
