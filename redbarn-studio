@@ -1,12 +1,12 @@
 #!/usr/bin/python3
 # Copyright (C) 2026 Redbarn Christian Co.
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Redbarn Studio: webcam and mic -> cinematic filters -> virtual camera and mic for Discord.
+"""Redbarn Studio: webcam and mic -> cinematic filters and a soundboard -> virtual camera and mic for Discord and other apps.
 
   redbarn-studio --install     add it to your app menu, then show what else is needed
   redbarn-studio --check       show what's installed and what's missing
   redbarn-studio --uninstall   remove it from your app menu
-  redbarn-studio --self-test   check the filters on a synthetic source (no webcam)
+  redbarn-studio --self-test   check the looks, voices and sounds on test signals (no webcam or mic)
 """
 import array
 import ctypes
@@ -34,7 +34,7 @@ elif WINDOWS and sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the console's default code page can't print ✓
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 REPO_URL = "https://github.com/GoochGrenade/redbarn-studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
 MIC_NAME = "CABLE Output" if WINDOWS else "Redbarn Mic"  # what to pick in Discord
@@ -282,7 +282,7 @@ def install(home=None):
         f.write(f"""[Desktop Entry]
 Type=Application
 Name={APP_NAME}
-Comment=Cinematic camera looks and voice filters for Discord
+Comment=Cinematic camera looks, voice filters and a soundboard for Discord and other apps
 Exec={desktop_quote(program)}
 Icon={APP_ID}
 Categories=AudioVideo;Video;
@@ -1164,7 +1164,7 @@ class RedbarnStudio(Adw.Application):
         self.volume, self.my_volume = scales
         self.my_volume_row = row
         self.sound_group = Adw.PreferencesGroup(title="Soundboard",
-                                                description="Plays through the mic. Press + or drag clips here.")
+                                                description="Broadcasts to microphone. Press + or drag clips here.")
         actions = Gtk.Box(spacing=6)
         for icon, label, handler in (("add", "Add sounds", self.on_add_sounds), ("folder", "Open sounds folder", self.on_open_sounds),
                                      ("stop", "Stop sounds", self.on_stop_sounds)):
@@ -1259,7 +1259,7 @@ class RedbarnStudio(Adw.Application):
         about = Adw.AboutDialog(application_name=APP_NAME, application_icon=APP_ID, version=VERSION,
                                 developer_name="Redbarn Christian Co.", copyright=COPYRIGHT, license_type=Gtk.License.GPL_3_0,
                                 website=REPO_URL, issue_url=f"{REPO_URL}/issues",
-                                comments="Cinematic camera looks, voice filters and a soundboard for Discord.")
+                                comments="Cinematic camera looks, voice filters and a soundboard for Discord and other apps.")
         about.add_acknowledgement_section("Built with", [
             "GStreamer https://gstreamer.freedesktop.org", "GTK https://gtk.org",
             "libadwaita https://gnome.pages.gitlab.gnome.org/libadwaita/", "Rubber Band Library https://breakfastquay.com/rubberband/"])
@@ -1270,7 +1270,7 @@ class RedbarnStudio(Adw.Application):
         page = Adw.PreferencesPage()
         dialog.add(page)
         check_again = Gtk.Button(label="Check Again", css_classes=["flat"], valign=Gtk.Align.CENTER)
-        checks = Adw.PreferencesGroup(title="Setup check", description="Everything Redbarn Studio needs on this computer.",
+        checks = Adw.PreferencesGroup(title="Setup Check", description="Everything Redbarn Studio needs on this computer.",
                                       header_suffix=check_again)
         check_again.connect("clicked", lambda _: self.fill_checks(dialog, checks))
         self.fill_checks(dialog, checks)
@@ -1279,10 +1279,10 @@ class RedbarnStudio(Adw.Application):
         loopback = find_loopback()
         camera = loopback[1] if loopback else "the virtual camera"
         for title, rows in (
-            ("Use it in Discord", (
+            ("Use It in Discord", (
                 "1. In Discord, open Settings, then Voice &amp; Video.",
-                f"2. Under Camera, choose “{GLib.markup_escape_text(camera)}”.",
-                f"3. Under Input Device, choose “{MIC_NAME}”.",
+                f"2. Under Camera, choose '{GLib.markup_escape_text(camera)}'.",
+                f"3. Under Input Device, choose '{MIC_NAME}'.",
                 f"4. Keep {APP_NAME} open while you’re in a call.")),
             ("Tips", (
                 "Use headphones with Voice Playback, or your mic will pick up its own output.",
@@ -1296,8 +1296,8 @@ class RedbarnStudio(Adw.Application):
                 group.add(Adw.ActionRow(title=text, title_lines=0))
             page.add(group)
 
-        more = Adw.PreferencesGroup(title="More help")
-        for title, uri in (("Online guide", f"{REPO_URL}#readme"), ("Report a problem", f"{REPO_URL}/issues/new")):
+        more = Adw.PreferencesGroup(title="More Help")
+        for title, uri in (("Online Guide", f"{REPO_URL}#readme"), ("Report a Problem", f"{REPO_URL}/issues/new")):
             row = Adw.ActionRow(title=title, activatable=True)
             row.add_prefix(Gtk.Image(icon_name=ICONS["link"]))
             row.connect("activated", lambda _, uri=uri: self.open_uri(uri))
