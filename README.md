@@ -8,7 +8,7 @@ Cinematic camera looks, voice filters and a soundboard for Discord and other app
 
 **Soundboard:** six original sounds (Air Horn, Ba-Dum-Tss, Sad Trombone, Buzzer, Ding and Crickets), plus any MP3, WAV or OGG clips you add with the **+** button or by dragging them onto the soundboard. Search finds a sound quickly, and right-clicking one of your own clips removes it. Sounds broadcast through the mic, so everyone on the call hears them. **Output Volume** sets how loud they are for others, and **Monitor Volume** sets how loud they are for you. Redbarn Studio doesn't include game or meme sounds, because they belong to their owners. You can download clips yourself, for example from [myinstants.com](https://www.myinstants.com), and add them.
 
-You can also hear your own filtered voice with **Voice Playback**, mirror the overlay text, flip the camera and switch between dark and light mode. Redbarn Studio remembers your settings, and **Setup & Help** in the menu (or F1) checks your computer and shows how to fix anything that's missing.
+The **Microphone** menu follows your computer's default mic, so plugging in a headset switches to it, or you can pick a mic. You can also hear your own filtered voice with **Voice Playback**, mirror the overlay text, flip the camera and switch between dark and light mode. Redbarn Studio remembers your settings, and **Setup & Help** in the menu (or F1) checks your computer and shows how to fix anything that's missing.
 
 ## Linux
 
@@ -36,16 +36,16 @@ Needs PipeWire, a webcam and a microphone.
 
 ## Windows
 
-**[Download Redbarn Studio for Windows](https://github.com/GoochGrenade/redbarn-studio/releases/download/v1.1.4-beta/Redbarn-Studio-Windows.zip)** (beta, 176 MB)
+**[Download the Redbarn Studio installer for Windows](https://github.com/GoochGrenade/redbarn-studio/releases/download/v1.2.0-beta/Redbarn-Studio-Setup.exe)** (beta, 114 MB, Windows 10 or 11, 64-bit)
 
-This is a beta: it passes all automated tests on a Windows build server, but hasn't been tested on a real Windows PC yet.
+1. Run **Redbarn-Studio-Setup.exe**. If Windows warns that it's from an unknown publisher, click **More info**, then **Run anyway**.
+2. Leave **Install the VB-CABLE virtual mic** ticked. The installer downloads VB-CABLE from [vb-audio.com](https://vb-audio.com/Cable/) and opens its setup: click **Install Driver**. VB-CABLE is donationware by VB-Audio.
+3. Restart Windows when the installer asks.
+4. Open Redbarn Studio from the Start menu. In Discord or any other app, choose **OBS Virtual Camera** as the camera and **CABLE Output** as the mic. Keep Redbarn Studio open while you use them.
 
-1. Install [OBS Studio](https://obsproject.com), which provides the virtual camera. You don't need to open it.
-2. Install [VB-CABLE](https://vb-audio.com/Cable/), which provides the virtual mic, then restart Windows.
-3. Unzip the download and open **Redbarn Studio.exe**. If Windows warns that it's from an unknown publisher, click **More info**, then **Run anyway**.
-4. In Discord, under **Settings > Voice & Video**, choose **OBS Virtual Camera** and **CABLE Output**. Keep Redbarn Studio open while you use them.
+The installer includes the virtual camera, so you don't need OBS Studio. If you already have OBS Studio, its virtual camera is used instead.
 
-If something's wrong, open **Setup & Help** from the menu (or press F1) to see what's missing, with download links. See the [release notes](https://github.com/GoochGrenade/redbarn-studio/releases/tag/v1.1.4-beta) for more help.
+If something's wrong, open **Setup & Help** from the menu (or press F1) to see what's missing, with download links. See the [release notes](https://github.com/GoochGrenade/redbarn-studio/releases/tag/v1.2.0-beta) for more help.
 
 ## Tips
 
