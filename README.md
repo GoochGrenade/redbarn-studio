@@ -14,7 +14,7 @@ The **Microphone** menu follows your computer's default mic, so plugging in a he
 
 Needs PipeWire, a webcam and a microphone.
 
-1. Download the `redbarn-studio` file.
+1. **[Download the `redbarn-studio` file](https://github.com/GoochGrenade/redbarn-studio/releases/latest/download/redbarn-studio)** (130 KB).
 2. In a terminal, in the folder you saved it to, run:
    ```
    python3 redbarn-studio --install
