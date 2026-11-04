@@ -6,7 +6,7 @@ Cinematic camera looks, voice filters and a soundboard for Discord and other app
 
 **15 voices:** Normal, Deep, Chipmunk, Child, Female, Male, Robot, Walkie-Talkie, Cave, Demon, Alien, Ghost, Ghostface, Orc Warlord and Adventurer.
 
-**Soundboard:** six original sounds (Air Horn, Ba-Dum-Tss, Sad Trombone, Buzzer, Ding and Crickets), plus any MP3, WAV or OGG clips you add with the **+** button or by dragging them onto the soundboard. Search finds a sound quickly, and right-clicking one of your own clips removes it. Sounds broadcast through the mic, so everyone on the call hears them. **Output Volume** sets how loud they are for others, and **Monitor Volume** sets how loud they are for you. Redbarn Studio doesn't include game or meme sounds, because they belong to their owners. You can download clips yourself, for example from [myinstants.com](https://www.myinstants.com), and add them.
+**Soundboard:** six original sounds (Air Horn, Ba-Dum-Tss, Sad Trombone, Buzzer, Ding and Crickets), plus any MP3, WAV or OGG clips you add with the **+** button or by dragging them onto the soundboard. Search finds a sound quickly, and right-clicking one of your own clips removes it. Sounds broadcast through the mic, so everyone on the call hears them. Every clip is matched to about the loudness of a voice, so quiet and loud clips come out alike. **Output Volume** sets how loud they are for others, and **Monitor Volume** sets how loud they are for you. Redbarn Studio doesn't include game or meme sounds, because they belong to their owners. You can download clips yourself, for example from [myinstants.com](https://www.myinstants.com), and add them.
 
 The **Microphone** menu follows your computer's default mic, so plugging in a headset switches to it, or you can pick a mic. You can also hear your own filtered voice with **Voice Playback**, mirror the overlay text, flip the camera and switch between dark and light mode. Redbarn Studio remembers your settings, and **Setup & Help** in the menu (or F1) checks your computer and shows how to fix anything that's missing.
 
@@ -51,7 +51,7 @@ If something's wrong, open **Setup & Help** from the menu (or press F1) to see w
 
 - Use headphones with **Voice Playback**, or your mic will pick up its own output.
 - If people on a call see the overlay text backwards, turn off **Mirror Overlay Text**. Discord mirrors your own view of your camera, so the text can look backwards only to you.
-- If a voice sounds wrong in Discord, or the soundboard is cut off, try turning off Discord's noise suppression.
+- If sounds get cut off or a voice sounds wrong in Discord, set **Noise Suppression** to **None** or **Standard** under **Settings > Voice & Video**. Krisp is built to remove anything that isn't speech, sound effects included, and no app that sends sounds through a mic can get around that.
 
 ## Licence
 

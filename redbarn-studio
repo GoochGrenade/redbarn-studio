@@ -11,6 +11,7 @@
 import array
 import ctypes
 import ctypes.util
+import functools
 import glob
 import json
 import math
@@ -35,7 +36,7 @@ elif WINDOWS and sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the console's default code page can't print ✓
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 REPO_URL = "https://github.com/GoochGrenade/redbarn-studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
 MIC_NAME = "CABLE Output" if WINDOWS else "Redbarn Mic"  # what to pick in Discord
@@ -1155,8 +1156,11 @@ def build_voice_pipeline(mic, output):
 
 
 SOUND_TYPES = (".mp3", ".wav", ".ogg", ".opus")
-SOUND_GAIN = 0.4  # at full slider: clips are mastered far louder than a voice through a mic
-MY_SOUND_GAIN = 1.0  # your own copy: apps like Discord boost voices, so the mic level sounds faint on your speakers
+# Every clip is matched to about the loudness of a voice through a mic (-20 dBFS RMS), at the sliders' defaults.
+# Clips are mastered at wildly different levels; far below speech, Discord's noise suppression and input
+# sensitivity treat them as background and cut them. Peaks never go above SOUND_PEAK, so nothing clips.
+SOUND_LEVEL, SOUND_PEAK = 0.1, 0.9
+SEND_DEFAULT, HEAR_DEFAULT = 0.6, 0.75
 SETTINGS_FILE = os.path.join(GLib.get_user_config_dir(), "redbarn-studio", "settings.json")
 ICON_DIR = os.path.join(GLib.get_user_cache_dir(), "redbarn-studio", "icons")
 ICONS = {
@@ -1260,6 +1264,41 @@ def play_sound(path, sink, volume, device=None):
     player.set_property("audio-sink", output)
     player.set_state(Gst.State.PLAYING)
     return player
+
+
+def decode_sound(path, rate=48000):
+    """All of a sound's samples, mono, played the way the soundboard plays it but into an appsink."""
+    player = play_sound(path, "audioconvert ! audioresample ! audio/x-raw,format=F32LE,rate=%d,channels=1 "
+                              "! appsink name=out sync=false" % rate, 1.0)
+    sink, samples = player.get_property("audio-sink").get_by_name("out"), array.array("f")
+    while sample := sink.emit("try-pull-sample", 5 * Gst.SECOND):
+        buffer = sample.get_buffer()
+        ok, info = buffer.map(Gst.MapFlags.READ)
+        if ok:
+            samples.frombytes(bytes(info.data))
+            buffer.unmap(info)
+    message = player.get_bus().pop_filtered(Gst.MessageType.ERROR)
+    player.set_state(Gst.State.NULL)
+    if message or not sink.get_property("eos"):
+        raise RuntimeError(message.parse_error()[0].message if message else f"{path} stalled")
+    return samples
+
+
+@functools.lru_cache(maxsize=None)
+def sound_level(path, mtime):
+    """A clip's loudness and peak. Loudness is measured on its loud parts, so silence and fades don't count."""
+    samples = decode_sound(path)  # full rate: resampling down would smooth away the sharpest peaks
+    powers = [sum(x * x for x in samples[i:i + 960]) / 960 for i in range(0, len(samples) - 959, 960)]  # 20ms windows
+    loud = [p for p in powers if p > max(powers, default=0) / 100]  # within 20dB of the loudest moment
+    if not loud:
+        return SOUND_LEVEL, SOUND_PEAK  # silent: leave it as it is
+    return math.sqrt(sum(loud) / len(loud)), max(map(abs, samples))
+
+
+def sound_volume(path, slider, default):
+    """Playback volume: speech level at the slider's default, cubic around it, never past SOUND_PEAK."""
+    level, top = sound_level(path, os.path.getmtime(path))
+    return min(SOUND_LEVEL / level * (slider / default) ** 3, SOUND_PEAK / top)
 
 
 def load_settings():
@@ -1463,7 +1502,7 @@ class RedbarnStudio(Adw.Application):
             lambda child: self.sound_search.get_text().lower() in child.get_child().get_tooltip_text().lower())
         volume_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
         scales = []
-        for title, default, icon in (("Output Volume", 0.6, "volume"), ("Monitor Volume", 0.75, "my_volume")):
+        for title, default, icon in (("Output Volume", SEND_DEFAULT, "volume"), ("Monitor Volume", HEAR_DEFAULT, "my_volume")):
             scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
             scale.set_value(default)
             scale.set_size_request(130, -1)  # same length for both, whatever the label
@@ -1547,15 +1586,16 @@ class RedbarnStudio(Adw.Application):
         for key, row in (("mirror", self.mirror), ("flip", self.flip_camera), ("dark", self.dark)):
             if isinstance(saved.get(key), bool):
                 row.set_active(saved[key])
-        if isinstance(saved.get("sound_level"), (int, float)):  # renamed in 1.1.1: older "volume" values used a louder scale
-            self.volume.set_value(saved["sound_level"])
-        if isinstance(saved.get("my_sound_level"), (int, float)):
-            self.my_volume.set_value(saved["my_sound_level"])
+        # Renamed in 1.3.1, as "volume" was in 1.1.1: the sliders' defaults are now speech level, so old values don't carry over.
+        if isinstance(saved.get("send_level"), (int, float)):
+            self.volume.set_value(saved["send_level"])
+        if isinstance(saved.get("hear_level"), (int, float)):
+            self.my_volume.set_value(saved["hear_level"])
 
     def current_settings(self):
         return {"look": self.look, "mic": self.mic_choice, "voice": list(VOICES)[self.voice_menu.get_selected()], "mirror": self.mirror.get_active(),
-                "flip": self.flip_camera.get_active(), "dark": self.dark.get_active(), "sound_level": round(self.volume.get_value(), 2),
-                "my_sound_level": round(self.my_volume.get_value(), 2)}
+                "flip": self.flip_camera.get_active(), "dark": self.dark.get_active(), "send_level": round(self.volume.get_value(), 2),
+                "hear_level": round(self.my_volume.get_value(), 2)}
 
     def quit_app(self):
         window = self.get_active_window()
@@ -1602,7 +1642,8 @@ class RedbarnStudio(Adw.Application):
                 "Use headphones with Voice Playback, or your mic will pick up its own output.",
                 "If people see the overlay text backwards, turn off Mirror Overlay Text. "
                 "Discord mirrors your own view of your camera, so it can look backwards only to you.",
-                "If a voice sounds wrong or sounds get cut off, turn off Discord’s noise suppression.",
+                "If sounds get cut off or a voice sounds wrong, set Discord’s Noise Suppression to None or Standard. "
+                "Krisp is built to remove anything that isn’t speech, sound effects included.",
                 "To remove one of your own sounds, right-click it, or press and hold it.")),
         ):
             group = Adw.PreferencesGroup(title=title)
@@ -1863,6 +1904,7 @@ class RedbarnStudio(Adw.Application):
         if files == self.sound_files:
             return
         self.sound_files = files
+        threading.Thread(target=self.measure_sounds, args=([builtin_sound(n) for n in SOUNDS] + files,), daemon=True).start()
         self.sound_buttons.remove_all()
         for name, path in [(name, None) for name in SOUNDS] + [(os.path.splitext(os.path.basename(f))[0], f) for f in files]:
             button = Gtk.Button(child=Gtk.Label(label=name, ellipsize=Pango.EllipsizeMode.END, max_width_chars=12), tooltip_text=name)
@@ -1872,6 +1914,14 @@ class RedbarnStudio(Adw.Application):
                     gesture.connect("pressed", lambda *_, button=button, path=path: self.offer_remove(button, path))
                     button.add_controller(gesture)
             self.sound_buttons.append(button)
+
+    @staticmethod
+    def measure_sounds(paths):
+        for path in paths:
+            try:
+                sound_level(path, os.path.getmtime(path))
+            except (OSError, RuntimeError):
+                pass  # reported when it's played
 
     def offer_remove(self, button, path):
         remove = Gtk.Button(label="Remove", css_classes=["flat", "destructive-action"])
@@ -1896,14 +1946,13 @@ class RedbarnStudio(Adw.Application):
             path = path or builtin_sound(name)
             # Voice Playback already plays the mic to the speakers: a second copy then would double it.
             for device in (self.sound_output, *(() if self.monitor.get_active() else (None,))):
-                gain, scale = (SOUND_GAIN, self.volume) if device else (MY_SOUND_GAIN, self.my_volume)
-                # Cubic, like desktop volume controls: a linear slider is too loud for most of its travel.
-                player = play_sound(path, SOUND_SINK, gain * scale.get_value() ** 3, device)
+                scale, default = (self.volume, SEND_DEFAULT) if device else (self.my_volume, HEAR_DEFAULT)
+                player = play_sound(path, SOUND_SINK, sound_volume(path, scale.get_value(), default), device)
                 bus = player.get_bus()
                 bus.add_signal_watch()
                 bus.connect("message", self.on_sound_message, player, name, device)
                 self.sounds.append(player)
-        except (GLib.Error, OSError) as e:
+        except (GLib.Error, OSError, RuntimeError) as e:
             self.toasts.add_toast(Adw.Toast(title=f"Couldn't play {name}: {e}"))
 
     def on_sound_message(self, bus, message, player, name, device):
@@ -2293,30 +2342,12 @@ def check_picture_not_mirrored():
     assert changed < 1, "mirroring the text altered the picture"
 
 
-def record_sound(path):
-    """All of a sound's samples, played the way the soundboard plays it but into an appsink."""
-    player = play_sound(path, "audioconvert ! audioresample ! audio/x-raw,format=F32LE,rate=48000,channels=1 "
-                              "! appsink name=out sync=false", 1.0)
-    sink, samples = player.get_property("audio-sink").get_by_name("out"), []
-    while sample := sink.emit("try-pull-sample", 5 * Gst.SECOND):
-        buffer = sample.get_buffer()
-        ok, info = buffer.map(Gst.MapFlags.READ)
-        assert ok, "couldn't read audio"
-        samples += struct.unpack(f"<{len(info.data) // 4}f", bytes(info.data))
-        buffer.unmap(info)
-    message = player.get_bus().pop_filtered(Gst.MessageType.ERROR)
-    player.set_state(Gst.State.NULL)
-    assert not message, message.parse_error()[0].message if message else ""
-    assert sink.get_property("eos"), f"{path} stalled"
-    return samples
-
-
 def check_sounds():
     """Built-in sounds, through the soundboard's real player; writes only to a temporary folder."""
     global BUILTIN_DIR
     with tempfile.TemporaryDirectory() as BUILTIN_DIR:
         for name in SOUNDS:
-            samples = record_sound(builtin_sound(name))
+            samples = decode_sound(builtin_sound(name))
             print(f"{name:13} {len(samples) / RATE:.2f}s, peak {peak(samples):.2f}")
             assert 0.3 < len(samples) / RATE < 3 and peak(samples) > 0.5, f"{name} is silent or the wrong length"
             if name == "Sad Trombone":
@@ -2329,6 +2360,25 @@ def check_sounds():
                 drum, tss = tone_frequency(samples[:RATE // 8]), tone_frequency(samples[int(0.8 * RATE):int(1.2 * RATE)])
                 print(f"Ba-Dum-Tss crossings: drum {drum:.0f}/s, cymbal {tss:.0f}/s")
                 assert tss > 3 * drum, "Ba-Dum-Tss has no bright cymbal after the drums"
+
+        # Loudness matching: a loud clip and a very quiet one come out at speech level, and one sharp spike
+        # caps the gain so the clip never goes past SOUND_PEAK.
+        played = {}
+        for name, level, spike in (("loud", 0.8, 0.0), ("quiet", 0.02, 0.0), ("spiky", 0.02, 0.95)):
+            path = os.path.join(BUILTIN_DIR, f"{name}.wav")
+            tone = [level * math.sin(2 * math.pi * 1000 * i / RATE) for i in range(RATE)]
+            tone[RATE // 2] = spike or tone[RATE // 2]
+            with wave.open(path, "wb") as out:
+                out.setnchannels(1)
+                out.setsampwidth(2)
+                out.setframerate(RATE)
+                out.writeframes(array.array("h", (int(x * 32767) for x in tone)).tobytes())
+            samples, volume = decode_sound(path), sound_volume(path, SEND_DEFAULT, SEND_DEFAULT)
+            played[name] = (math.sqrt(sum(x * x for x in samples) / len(samples)) * volume, peak(samples) * volume)
+        print("Loudness matching: " + ", ".join(f"{n} rms {r:.3f} peak {p:.2f}" for n, (r, p) in played.items()))
+        for name in ("loud", "quiet"):
+            assert abs(20 * math.log10(played[name][0] / SOUND_LEVEL)) < 1, f"the {name} clip isn't matched to speech level"
+        assert max(p for _, p in played.values()) <= SOUND_PEAK + 0.01, "a clip is played past its peak limit"
 
 
 def check_mic_list():
@@ -2353,7 +2403,7 @@ def check_settings():
     with tempfile.TemporaryDirectory() as folder:
         SETTINGS_FILE = os.path.join(folder, "settings.json")
         assert load_settings() == {}, "missing settings should load as defaults"
-        saved = {"look": "VHS", "voice": "Robot", "mirror": False, "flip": True, "dark": False, "sound_level": 0.35, "my_sound_level": 0.8}
+        saved = {"look": "VHS", "voice": "Robot", "mirror": False, "flip": True, "dark": False, "send_level": 0.35, "hear_level": 0.8}
         save_settings(saved)
         assert load_settings() == saved, "settings didn't survive a save and load"
         with open(SETTINGS_FILE, "w") as f:
