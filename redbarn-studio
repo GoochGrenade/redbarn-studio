@@ -35,7 +35,7 @@ elif WINDOWS and sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the console's default code page can't print ✓
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 REPO_URL = "https://github.com/GoochGrenade/redbarn-studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
 MIC_NAME = "CABLE Output" if WINDOWS else "Redbarn Mic"  # what to pick in Discord
@@ -380,7 +380,7 @@ CSS = """
 """
 
 LOOKS = ["Clean", "Night Vision", "Grainy Film", "Hi-Def", "2008 Webcam", "VHS", "Noir", "CCTV",
-         "Camcorder", "Thermal", "Silent Film", "Blockbuster", "Red Barn"]
+         "Camcorder", "Thermal", "Silent Film", "Blockbuster", "Red Barn", "Warband", "Old Quest"]
 GRAINY_LOOKS = ["Night Vision", "Grainy Film", "VHS", "Noir", "CCTV", "Camcorder", "Silent Film"]
 PREVIEW_WIDTH, PREVIEW_HEIGHT = 640, 360
 
@@ -607,6 +607,93 @@ vec3 red_barn(vec2 uv) {
   }
   return c;
 }
+// An orc war camp: banded timber, iron spikes, bone tusks and red-and-black banners.
+vec3 warband_frame(vec2 px, float edge, float along) {
+  vec3 c = vec3(0.3, 0.17, 0.09) * (0.45 + 0.8 * fbm(vec2(along * 0.02, edge * 0.35)));
+  float band = mod(along, 160.0) - 80.0;
+  if (abs(band) < 9.0) {  // iron bands around the timber, riveted through
+    c = vec3(0.15, 0.13, 0.12) * (0.6 + 0.7 * fbm(px * 0.05));
+    c = mix(c, vec3(0.45, 0.4, 0.36), smoothstep(4.0, 2.5, length(vec2(band, edge - 16.0))));
+  }
+  return c * mix(0.55, 1.15, smoothstep(0.0, 5.0, edge)) * mix(1.0, 0.6, smoothstep(26.0, 32.0, edge));
+}
+// A tusk curving in from a corner, q measured in pixels from that corner, with a leather wrap at its base.
+vec4 warband_tusk(vec2 q) {
+  vec2 v = q - vec2(40.0, 160.0);
+  float t = (atan(v.y, v.x) + 1.5708) / 1.0472;
+  float w = 14.0 * (1.0 - t), d = length(v) - 120.0;
+  if (t < 0.0 || t > 1.0 || abs(d) > w) return vec4(0.0);
+  if (t < 0.12) return vec4(vec3(0.3, 0.18, 0.1) * (0.75 + 0.4 * step(0.5, fract(t * 50.0))), 1.0);
+  return vec4(vec3(0.86, 0.8, 0.66) * mix(1.15, 0.5, d / w * 0.5 + 0.5), 1.0);
+}
+vec3 warband_banner(vec2 b, float side) {  // b runs 0 to 1 across and down the banner
+  float cloth = fbm(vec2(b.x * 6.0 + side * 9.0, b.y * 30.0));
+  vec3 c = vec3(0.5, 0.04, 0.03) * (0.7 + 0.6 * cloth) * (0.85 + 0.2 * cos(b.x * 18.85));  // folds
+  float chevron = b.y - (0.45 + abs(b.x - 0.5) * 0.7);
+  if (b.x < 0.09 || b.x > 0.91 || (chevron > 0.0 && chevron < 0.08)) c = vec3(0.06, 0.05, 0.05) * (0.8 + 0.5 * cloth);
+  return c * mix(1.0, 0.6, b.y);
+}
+vec3 warband(vec2 uv) {
+  vec2 px = uv * vec2(1280.0, 720.0);
+  vec2 corner = min(px, vec2(1280.0, 720.0) - px);
+  float edge = min(corner.x, corner.y);
+  float along = corner.y < corner.x ? px.x : px.y;
+  vec4 tusk = warband_tusk(corner);
+  if (tusk.a > 0.0) return tusk.rgb;
+  if (edge < 32.0) return warband_frame(px, edge, along);
+  for (float s = 0.0; s < 2.0; s += 1.0) {  // banners hang from wooden rods, swaying more lower down
+    float sway = sin(time * 1.4 + s * 2.0) * 0.006 * uv.y;
+    vec2 b = vec2((uv.x - mix(0.13, 0.79, s) - sway) / 0.08, (uv.y - 0.044) / 0.4);
+    if (b.y > 0.0 && b.y < 0.035 && abs(b.x - 0.5) < 0.62) return vec3(0.28, 0.16, 0.08) * (0.6 + 0.6 * fbm(px * 0.2));
+    float tear = 0.1 * abs(b.x - 0.5) + 0.03 * barn_noise(vec2(floor(b.x * 14.0), s));
+    if (b.x > 0.0 && b.x < 1.0 && b.y > 0.0 && b.y < 0.86 + tear) return warband_banner(b, s);
+  }
+  float spike = 1.0 - (edge - 32.0) / 26.0;  // iron spikes along the inside of the frame
+  float sx = mod(along, 80.0) - 40.0;
+  if (spike > 0.0 && abs(sx) < 9.0 * spike) return vec3(0.1, 0.09, 0.09) * mix(0.6, 1.6, step(0.0, sx)) * (0.7 + 0.5 * spike);
+
+  vec3 c = clamp(get(uv), 0.0, 1.0);
+  float l = luma(c);
+  c = mix(vec3(l), c, 0.55);
+  c = c * c * (3.0 - 2.0 * c);
+  c *= mix(vec3(0.8, 0.35, 0.25), vec3(1.2, 0.92, 0.7), smoothstep(0.1, 0.75, l));  // red-rock shadows, warm highlights
+  float flicker = 0.85 + 0.15 * sin(time * 9.0) * sin(time * 5.3);
+  c += vec3(0.55, 0.16, 0.02) * smoothstep(0.55, 1.0, uv.y) * 0.45 * flicker;  // firelight from below
+  c *= mix(0.55, 1.0, vignette(uv, 1.1));
+  for (float layer = 1.0; layer < 3.0; layer += 1.0) {  // embers rising from the fire
+    vec2 p = uv * vec2(14.0, 8.0) * layer + vec2(sin(time * 0.9 + uv.y * 5.0 + layer) * 0.25, time * 1.6 * layer);
+    vec2 cell = floor(p);
+    vec2 centre = vec2(barn_noise(cell), barn_noise(cell + 5.0)) * 0.6 + 0.2;
+    float ember = smoothstep(0.07, 0.0, length(fract(p) - centre)) * step(0.8, barn_noise(cell + layer * 3.0));
+    c += vec3(1.0, 0.55, 0.15) * ember * smoothstep(0.05, 0.9, uv.y) * (0.6 + 0.4 * sin(time * 7.0 + cell.x * 3.0));
+  }
+  return c;
+}
+// An early-2000s fantasy game: earthy brown stone, a dark wooden bevel and chunky blocks of colour.
+vec3 castle_stone(vec2 px, float edge, float along) {
+  float row = floor(edge / 20.0);
+  float bx = along + row * 27.0;  // each course of blocks is offset by half a block
+  vec2 f = vec2(mod(bx, 54.0), mod(edge, 20.0));
+  float mortar = min(min(f.x, 54.0 - f.x), min(f.y, 20.0 - f.y));
+  vec3 stone = vec3(0.42, 0.37, 0.3) * (0.72 + 0.32 * barn_noise(vec2(floor(bx / 54.0), row))) * (0.75 + 0.4 * fbm(px * 0.09));
+  return stone * mix(0.4, 1.0, smoothstep(0.5, 2.5, mortar)) * mix(1.1, 0.8, (px.x / 1280.0 + px.y / 720.0) * 0.5);
+}
+vec3 old_quest(vec2 uv) {
+  vec2 px = uv * vec2(1280.0, 720.0);
+  vec2 corner = min(px, vec2(1280.0, 720.0) - px);
+  float edge = min(corner.x, corner.y);
+  float stud = length(corner - vec2(43.0));
+  if (stud < 15.0) return vec3(0.72, 0.56, 0.25) * mix(1.3, 0.5, stud / 15.0);  // brass studs at the corners
+  if (edge < 40.0) return castle_stone(px, edge, corner.y < corner.x ? px.x : px.y);
+  if (edge < 47.0) return vec3(0.22, 0.15, 0.08) * mix(1.5, 0.6, abs(edge - 42.0) / 5.0);  // dark wooden bevel
+
+  vec2 grid = vec2(320.0, 180.0);
+  vec3 c = clamp(get((floor(uv * grid) + 0.5) / grid), 0.0, 1.0);
+  c = clamp(mix(vec3(luma(c)), c, 1.15), 0.0, 1.0);
+  c = floor(c * 8.0 + 0.5) / 8.0 * vec3(1.05, 1.0, 0.86);  // flat, earthy blocks of colour
+  float torch = 1.0 + 0.04 * sin(time * 7.0) + 0.03 * sin(time * 12.7);
+  return c * torch * mix(0.5, 1.0, smoothstep(47.0, 80.0, edge));  // shadow cast by the frame
+}
 
 void main() {
   vec2 uv = v_texcoord;
@@ -623,7 +710,9 @@ void main() {
   else if (mode < 9.5) c = thermal(uv);
   else if (mode < 10.5) c = silent_film(uv);
   else if (mode < 11.5) c = blockbuster(uv);
-  else c = red_barn(uv);
+  else if (mode < 12.5) c = red_barn(uv);
+  else if (mode < 13.5) c = warband(uv);
+  else c = old_quest(uv);
   gl_FragColor = vec4(c, 1.0);
 }
 """
@@ -709,6 +798,9 @@ VOICES = {
     "Alien": {"pitch": 1.2, "formant": 0.7, "echo": (10, 0.5, 0.45), "drive": 1.3},
     "Ghost": {"pitch": 1.06, "formant": 1.15, "highpass": 250.0, "echo": (260, 0.4, 0.4), "reverb": 0.55},
     "Ghostface": {"pitch": 0.78, "formant": 0.85, "highpass": 120.0, "lowpass": 4000.0, "drive": 1.8, "echo": (8, 0.35, 0.3)},
+    # Resonance below pitch gives a huge chest; the drive growls on loud words only.
+    "Orc Warlord": {"pitch": 0.78, "formant": 0.68, "lowpass": 5000.0, "drive": 2.0, "reverb": 0.15},
+    "Adventurer": {"pitch": 1.1, "formant": 1.0, "highpass": 100.0, "reverb": 0.2},
 }
 RUBBERBAND_MISSING = "This voice needs the Rubber Band library, so it sounds like Normal. Open Setup & Help (F1) to fix it."
 MIC_LOST = f"No sound is reaching {APP_NAME} from your mic. Check it's plugged in."
@@ -1797,7 +1889,7 @@ def check_voices():
         print("Rubber Band isn't installed: skipping the pitch voices")
     for name, expected in (("Normal", 440), ("Deep", 330), ("Chipmunk", 704), ("Child", 748), ("Female", 660),
                            ("Male", 352), ("Robot", 405), ("Demon", 273), ("Alien", 528), ("Ghost", 466),
-                           ("Ghostface", 343), ("Normal", 440)):
+                           ("Ghostface", 343), ("Orc Warlord", 343), ("Adventurer", 484), ("Normal", 440)):
         if not pitched and "pitch" in VOICES[name]:
             continue
         measured = tone_frequency(voice_at(name))
@@ -1857,15 +1949,56 @@ def check_formants():
     assert male < female * 0.9, "Male's resonance isn't lower than Female's"
 
 
-def check_red_barn():
+def pixels(frame, left, right, top, bottom):
+    return [frame[(y * 1280 + x) * 4:(y * 1280 + x) * 4 + 3] for y in range(top, bottom, 3) for x in range(left, right, 3)]
+
+
+def colour_bars(look):
+    """A pipeline showing a look over colour bars, bright cyan at x=500 and red at x=1000, and its sink."""
     pipeline = Gst.parse_launch(
         "videotestsrc is-live=true pattern=smpte75 ! video/x-raw,format=I420,width=1280,height=720,framerate=30/1 "
         f"! {FILTER_CHAIN} ! videoconvert ! video/x-raw,format=RGBA "
         "! appsink name=sink sync=false drop=true max-buffers=1"
     )
-    fx, sink = pipeline.get_by_name("fx"), pipeline.get_by_name("sink")
+    fx = pipeline.get_by_name("fx")
     attach_shader(fx)
-    set_look(fx, "Red Barn")
+    set_look(fx, look)
+    return pipeline, pipeline.get_by_name("sink")
+
+
+def check_game_looks():
+    frames = {}
+    for name in ("Warband", "Old Quest"):
+        pipeline, sink = colour_bars(name)
+        pipeline.set_state(Gst.State.PLAYING)
+        time.sleep(0.4)
+        first = pull_bytes(sink)
+        time.sleep(0.4)
+        frames[name] = first, pull_bytes(sink)
+        pipeline.set_state(Gst.State.NULL)
+        assert first[(360 * 1280 + 500) * 4 + 1] > 2 * first[(360 * 1280 + 1000) * 4 + 1], f"{name} lost the camera picture"
+
+    camp, later = frames["Warband"]
+    banner, timber, inside = pixels(camp, 190, 240, 60, 250), pixels(camp, 4, 28, 200, 500), (300, 980, 150, 600)
+    tusk = pixels(camp, 70, 110, 30, 70)
+    embers = difference(pixels(camp, *inside), pixels(later, *inside))
+    print(f"Warband: banner red {mean(banner, 0):.0f} vs green {mean(banner, 1):.0f}, timber {mean(timber, 0):.0f}/{mean(timber, 2):.0f}, "
+          f"tusk {mean(tusk):.0f}, ember movement {embers:.2f}")
+    assert mean(banner, 0) > 2.5 * mean(banner, 1), "Warband banners aren't red"
+    assert mean(timber) < 90 and mean(timber, 0) > 1.5 * mean(timber, 2), "Warband has no timber frame"
+    assert sum(min(p) > 120 for p in tusk) > len(tusk) * 0.2, "Warband has no bone tusks"
+    assert embers > 0.02, "Warband embers aren't moving"
+
+    castle = frames["Old Quest"][0]
+    stone, bevel = pixels(castle, 4, 36, 200, 500), pixels(castle, 41, 46, 200, 500)
+    print(f"Old Quest: stone {mean(stone):.0f} (red-blue {mean(stone, 0) - mean(stone, 2):.0f}), "
+          f"bevel {mean(bevel, 0):.0f}/{mean(bevel, 1):.0f}/{mean(bevel, 2):.0f}")
+    assert 40 < mean(stone) < 160 and 0 < mean(stone, 0) - mean(stone, 2) < 50, "Old Quest has no brown stone frame"
+    assert mean(bevel) < mean(stone) and mean(bevel, 0) > 1.5 * mean(bevel, 2), "Old Quest has no wooden bevel"
+
+
+def check_red_barn():
+    pipeline, sink = colour_bars("Red Barn")
     pipeline.set_state(Gst.State.PLAYING)
     time.sleep(0.4)
     first = pull_bytes(sink)
@@ -1875,9 +2008,6 @@ def check_red_barn():
     time.sleep(0.3)
     flipped = pull_bytes(sink)
     pipeline.set_state(Gst.State.NULL)
-
-    def pixels(frame, left, right, top, bottom):
-        return [frame[(y * 1280 + x) * 4:(y * 1280 + x) * 4 + 3] for y in range(top, bottom, 3) for x in range(left, right, 3)]
 
     def change(a, b):
         return sum(abs(p - q) for x, y in zip(a, b) for p, q in zip(x, y)) / (3 * len(a))
@@ -2064,12 +2194,15 @@ def self_test():
     assert mean(silent, 0) > mean(silent, 1) > mean(silent, 2), "Silent Film isn't sepia"
     thermal = frames["Thermal"]
     assert sum(abs(r - b) for r, _, b in thermal) / len(thermal) > 20, "Thermal has no heat colours"
+    camp = frames["Warband"]
+    assert mean(camp, 0) > 1.3 * mean(camp, 2), "Warband isn't war-red"
     blockbuster = frames["Blockbuster"]
     assert mean(blockbuster[:len(blockbuster) // 20]) < 2, "Blockbuster has no black bars"
     clean = frames["Clean"]
     assert mean(clean[:len(clean) // 2]) < mean(clean[len(clean) // 2:]), "image is upside down"
     check_picture_not_mirrored()
     check_red_barn()
+    check_game_looks()
     assert len(LOOKS) == len(VOICES), "Looks and voices should stay equal in number"
     check_voices()
     check_formants()
