@@ -36,7 +36,7 @@ Needs PipeWire, a webcam and a microphone.
 
 ## Windows
 
-**[Download the Redbarn Studio installer for Windows](https://github.com/GoochGrenade/redbarn-studio/releases/download/v1.2.0-beta/Redbarn-Studio-Setup.exe)** (beta, 114 MB, Windows 10 or 11, 64-bit)
+**[Download the Redbarn Studio installer for Windows](https://github.com/GoochGrenade/redbarn-studio/releases/latest/download/Redbarn-Studio-Setup.exe)** (114 MB, Windows 10 or 11, 64-bit)
 
 1. Run **Redbarn-Studio-Setup.exe**. If Windows warns that it's from an unknown publisher, click **More info**, then **Run anyway**.
 2. Leave **Install the VB-CABLE virtual mic** ticked. The installer downloads VB-CABLE from [vb-audio.com](https://vb-audio.com/Cable/) and opens its setup: click **Install Driver**. VB-CABLE is donationware by VB-Audio.
@@ -45,7 +45,7 @@ Needs PipeWire, a webcam and a microphone.
 
 The installer includes the virtual camera, so you don't need OBS Studio. If you already have OBS Studio, its virtual camera is used instead.
 
-If something's wrong, open **Setup & Help** from the menu (or press F1) to see what's missing, with download links. See the [release notes](https://github.com/GoochGrenade/redbarn-studio/releases/tag/v1.2.0-beta) for more help.
+If something's wrong, open **Setup & Help** from the menu (or press F1) to see what's missing, with download links. See the [release notes](https://github.com/GoochGrenade/redbarn-studio/releases/latest) for more help.
 
 ## Tips
 
