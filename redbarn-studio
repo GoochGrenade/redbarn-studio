@@ -52,7 +52,7 @@ WINDOWS_HELP = {
 CABLE_INPUT = ("CABLE Input", "VB-Audio Virtual Cable")
 LOOPBACK_SETUP = 'sudo modprobe v4l2loopback exclusive_caps=1 card_label="Redbarn Camera"'
 GST_ELEMENTS = (*(("mfvideosrc", "decodebin", "wasapi2src", "wasapi2sink") if WINDOWS else ("v4l2src", "v4l2sink", "pulsesrc", "pulsesink")), "jpegdec", "glupload", "glshader", "gldownload", "textoverlay", "videoflip",
-                "appsrc", "appsink", "audiocheblimit", "audioecho", "audioamplify", "freeverb",
+                "appsrc", "appsink", "audiocheblimit", "audioecho", "audioamplify", "freeverb", "audiodynamic", "equalizer-nbands",
                 "playbin", "wavparse", "mpg123audiodec", "vorbisdec")
 PACKAGES = {  # (Fedora, Ubuntu/Debian)
     "ui": ("python3-gobject gtk4 libadwaita", "python3-gi gir1.2-gtk-4.0 gir1.2-adw-1"),
@@ -415,6 +415,9 @@ const vec2 PX = vec2(1.0 / 1280.0, 1.0 / 720.0);
 float rand(vec2 p) {
   return fract(sin(dot(p, vec2(12.9898, 78.233)) + fract(time) * 311.7) * 43758.5453);
 }
+float barn_noise(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);  // no time: wood mustn't shimmer, jitter must hold still
+}
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 float grain(vec2 uv, float amount) { return (rand(uv) - 0.5) * amount; }
 float vignette(vec2 uv, float amount) {
@@ -425,13 +428,22 @@ float scanlines(vec2 uv, float lines, float amount) {
   return 1.0 - amount * step(0.5, fract(uv.y * lines));
 }
 vec3 get(vec2 uv) { return texture2D(tex, uv).rgb; }
+// Bright parts of the picture spread into a soft glow, as lenses, film and sensors do: ring of 8 taps.
+vec3 bloom(vec2 uv, float radius, float threshold) {
+  vec3 glow = vec3(0.0);
+  for (float a = 0.0; a < 6.28; a += 0.785) glow += get(uv + vec2(cos(a), sin(a)) * PX * radius);
+  return max(glow / 8.0 - threshold, 0.0);
+}
 
 vec3 night_vision(vec2 uv) {
-  float g = pow(luma(get(uv)), 0.6) * 1.5 + grain(uv, 0.22);
+  vec2 o = PX * 2.0;
+  float l = (luma(get(uv)) * 2.0 + luma(get(uv + o)) + luma(get(uv - o))) * 0.25;  // soft, low-resolution sensor
+  float g = pow(l, 0.6) * 1.5 + luma(bloom(uv, 10.0, 0.75)) * 0.8 + grain(uv, 0.22);  // infrared highlights flare
   return vec3(0.08, 1.0, 0.14) * g * vignette(uv, 1.4);
 }
 vec3 grainy_film(vec2 uv) {
   vec3 c = mix(vec3(0.07, 0.06, 0.05), vec3(1.0, 0.95, 0.85), get(uv));
+  c += vec3(0.45, 0.08, 0.03) * luma(bloom(uv, 6.0, 0.6)) * 2.0;  // halation: film glows red around highlights
   float flicker = 1.0 + 0.025 * sin(time * 37.0);
   return (c + grain(uv, 0.16)) * flicker * vignette(uv, 0.8);
 }
@@ -445,19 +457,28 @@ vec3 hi_def(vec2 uv) {
   return mix(vec3(luma(c)), c, 1.25);
 }
 vec3 webcam_2008(vec2 uv) {
-  vec2 grid = vec2(320.0, 180.0);
-  vec3 c = get((floor(uv * grid) + 0.5) / grid);
+  vec3 c = get((floor(uv * vec2(320.0, 180.0)) + 0.5) / vec2(320.0, 180.0));
+  vec3 block = get((floor(uv * vec2(160.0, 90.0)) + 0.5) / vec2(160.0, 90.0));
+  c = mix(c, block, 0.7 * (1.0 - smoothstep(0.02, 0.12, length(c - block))));  // flat areas collapse into 8px blocks
+  vec3 chroma = get((floor(uv * vec2(80.0, 45.0)) + 0.5) / vec2(80.0, 45.0));
+  c = vec3(luma(c)) + (chroma - luma(chroma));  // colour is stored far coarser than brightness
   c = floor(c * 20.0 + 0.5) / 20.0;
-  c = pow(c, vec3(0.8)) * 1.15 * vec3(0.92, 1.0, 1.08);
-  return c + grain(uv, 0.03);
+  c = pow(max(c, 0.0), vec3(0.8)) * 1.15 * vec3(0.92, 1.0, 1.08) * (1.0 + 0.05 * sin(time * 0.7));  // auto-exposure hunting
+  vec3 noise = vec3(grain(uv, 0.05), grain(uv + 0.3, 0.07), grain(uv + 0.6, 0.09));
+  return c + noise * (0.4 + 1.0 - luma(c));  // coloured low-light sensor noise, worst in the shadows
 }
 vec3 vhs(vec2 uv) {
-  uv.x += sin(uv.y * 30.0 + time * 3.0) * 0.0015;
-  float band = abs(uv.y - fract(time * 0.13));
-  if (band < 0.02) uv.x += 0.012;
-  vec3 c = vec3(get(uv + vec2(0.004, 0.0)).r, get(uv).g, get(uv - vec2(0.004, 0.0)).b);
-  c = mix(vec3(luma(c)), c, 0.8);
-  c += grain(uv, band < 0.02 ? 0.35 : 0.06);
+  uv.y += (barn_noise(vec2(floor(time * 4.0), 3.0)) - 0.5) * 0.004;  // tracking settles to a new spot a few times a second
+  uv.x += sin(uv.y * 30.0 + time * 3.0) * 0.0008;
+  bool bar = barn_noise(vec2(floor(time * 1.5), 8.0)) > 0.9 && abs(uv.y - fract(time * 0.13)) < 0.025;  // a tracking error
+  bool head = uv.y > 0.975;  // head-switching noise along the bottom
+  if (bar) uv.x += 0.012;
+  if (head) uv.x += 0.02 + (rand(vec2(uv.y, 1.0)) - 0.5) * 0.01;
+  // Tape keeps far less colour detail than brightness, and the colour trails to the right.
+  vec3 smear = (get(uv) + get(uv - vec2(0.004, 0.0)) + get(uv - vec2(0.008, 0.0)) + get(uv - vec2(0.012, 0.0))) * 0.25;
+  vec3 c = vec3(luma(get(uv))) + (smear - luma(smear)) * 0.85;
+  c += grain(uv, bar ? 0.35 : 0.06);
+  if (head) c = mix(vec3(luma(c)), c, 0.2) + grain(uv, 0.3);
   return c * scanlines(uv, 240.0, 0.12);
 }
 vec3 noir(vec2 uv) {
@@ -465,7 +486,11 @@ vec3 noir(vec2 uv) {
   return vec3(g) * vignette(uv, 1.0);
 }
 vec3 cctv(vec2 uv) {
-  vec3 c = get(uv);
+  vec2 d = uv - 0.5;
+  vec2 a = d * vec2(1.78, 1.0);
+  vec2 src = 0.5 + d * (1.0 + 0.18 * dot(a, a)) * 0.9;  // wide-angle security lens: barrel distortion
+  if (src.x < 0.0 || src.x > 1.0 || src.y < 0.0 || src.y > 1.0) return vec3(0.0);
+  vec3 c = get(src) + bloom(src, 6.0, 0.7) * 0.6;
   c = mix(vec3(luma(c)), c, 0.15) * vec3(0.92, 1.0, 0.96);
   c = (c - 0.5) * 1.2 + 0.5 + grain(uv, 0.12);
   return c * scanlines(uv, 288.0, 0.14) * vignette(uv, 1.3);
@@ -482,20 +507,31 @@ vec3 camcorder(vec2 uv) {
   bool arm_y = abs(d.x - 0.485) < 0.0012 && d.y > 0.40 && d.y < 0.486;
   return arm_x || arm_y ? vec3(0.95) : c;
 }
+vec3 ironbow(float t) {
+  vec3 c = mix(vec3(0.0), vec3(0.2, 0.0, 0.45), smoothstep(0.0, 0.2, t));
+  c = mix(c, vec3(0.7, 0.0, 0.55), smoothstep(0.2, 0.4, t));
+  c = mix(c, vec3(0.95, 0.3, 0.05), smoothstep(0.4, 0.6, t));
+  c = mix(c, vec3(1.0, 0.75, 0.0), smoothstep(0.6, 0.8, t));
+  return mix(c, vec3(1.0), smoothstep(0.8, 1.0, t));
+}
 vec3 thermal(vec2 uv) {
-  vec2 o = PX * 3.0;
-  float t = luma(get(uv) + get(uv + o) + get(uv - o) + get(uv + vec2(o.x, -o.y))) * 0.25;
-  t = pow(clamp(t, 0.0, 1.0), 0.7);
-  vec3 c = mix(vec3(0.02, 0.0, 0.25), vec3(0.6, 0.0, 0.7), smoothstep(0.0, 0.33, t));
-  c = mix(c, vec3(1.0, 0.35, 0.0), smoothstep(0.33, 0.66, t));
-  return mix(c, vec3(1.0, 1.0, 0.6), smoothstep(0.66, 1.0, t));
+  vec2 cell = (floor(uv * vec2(320.0, 240.0)) + 0.5) / vec2(320.0, 240.0);  // thermal sensors are low resolution
+  vec2 o = PX * 4.0;
+  float t = luma(get(cell) * 2.0 + get(cell + o) + get(cell - o) + get(cell + vec2(o.x, -o.y)) + get(cell + vec2(-o.x, o.y))) / 6.0;
+  vec3 c = ironbow(pow(clamp(t, 0.0, 1.0), 0.8));
+  vec2 px = uv * vec2(1280.0, 720.0);
+  if (px.x > 1220.0 && px.x < 1240.0 && abs(px.y - 360.0) < 200.0) c = ironbow((560.0 - px.y) / 400.0);  // scale bar, hot at top
+  vec2 d = abs(px - vec2(640.0, 360.0));
+  if ((d.x < 1.0 && d.y > 6.0 && d.y < 22.0) || (d.y < 1.0 && d.x > 6.0 && d.x < 22.0)) c = vec3(1.0);  // centre crosshair
+  return c;
 }
 vec3 silent_film(vec2 uv) {
-  uv.y += (rand(vec2(1.0, 7.0)) - 0.5) * 0.006;
+  float frame = floor(time * 18.0);  // hand-cranked frame rate: the weave and flicker change once per frame
+  uv = (uv - 0.5) / 1.02 + 0.5 + (vec2(barn_noise(vec2(frame, 1.0)), barn_noise(vec2(frame, 2.0))) - 0.5) * vec2(0.004, 0.006);
   float g = (pow(luma(get(uv)), 0.7) - 0.5) * 1.2 + 0.58 + grain(uv, 0.14);
   float scratch = 1.0 - step(abs(uv.x - rand(vec2(1.0, 2.0))), 0.0008) * step(0.6, rand(vec2(3.0, 4.0))) * 0.6;
   float dust = 1.0 - step(0.9995, rand(floor(uv * vec2(320.0, 180.0)))) * 0.8;
-  float flicker = 1.0 + 0.06 * sin(time * 40.0);
+  float flicker = 0.92 + 0.12 * barn_noise(vec2(frame, 5.0));
   return vec3(1.0, 0.86, 0.62) * g * scratch * dust * flicker * vignette(uv, 0.8);
 }
 vec3 blockbuster(vec2 uv) {
@@ -505,9 +541,6 @@ vec3 blockbuster(vec2 uv) {
   c = mix(c, c * c * (3.0 - 2.0 * c), 0.6);
   c *= mix(vec3(0.85, 1.0, 1.1), vec3(1.12, 1.0, 0.82), smoothstep(0.2, 0.7, l));
   return mix(vec3(luma(c)), c, 1.15);
-}
-float barn_noise(vec2 p) {
-  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);  // no time: wood mustn't shimmer
 }
 float wood_grain(vec2 p) {
   vec2 i = floor(p), f = fract(p);
@@ -607,52 +640,107 @@ vec3 red_barn(vec2 uv) {
   }
   return c;
 }
-// An orc war camp: banded timber, iron spikes, bone tusks and red-and-black banners.
-vec3 warband_frame(vec2 px, float edge, float along) {
-  vec3 c = vec3(0.3, 0.17, 0.09) * (0.45 + 0.8 * fbm(vec2(along * 0.02, edge * 0.35)));
-  float band = mod(along, 160.0) - 80.0;
-  if (abs(band) < 9.0) {  // iron bands around the timber, riveted through
-    c = vec3(0.15, 0.13, 0.12) * (0.6 + 0.7 * fbm(px * 0.05));
-    c = mix(c, vec3(0.45, 0.4, 0.36), smoothstep(4.0, 2.5, length(vec2(band, edge - 16.0))));
-  }
-  return c * mix(0.55, 1.15, smoothstep(0.0, 5.0, edge)) * mix(1.0, 0.6, smoothstep(26.0, 32.0, edge));
+// Shading for the framed looks, lit from the top left: n is the surface normal, shine and gloss make a glint.
+vec3 shade(vec3 base, vec3 n, float shine, float gloss) {
+  vec3 l = normalize(vec3(-0.45, -0.55, 0.7));
+  float spec = pow(max(dot(n, normalize(l + vec3(0.0, 0.0, 1.0))), 0.0), shine) * gloss;
+  return base * (0.3 + 0.9 * max(dot(n, l), 0.0)) + vec3(spec);
 }
-// A tusk curving in from a corner, q measured in pixels from that corner, with a leather wrap at its base.
-vec4 warband_tusk(vec2 q) {
+vec3 dome(vec2 v) { return vec3(v, sqrt(max(1.0 - dot(v, v), 0.0))); }  // v: offset from the centre / radius
+vec3 roll(vec2 dir, float u) { return vec3(dir * u, sqrt(max(1.0 - u * u, 0.0))); }  // rounded across dir, u from -1 to 1
+float frame_edge(vec2 px) { return min(min(px.x, 1280.0 - px.x), min(px.y, 720.0 - px.y)); }
+void frame_axes(vec2 px, out float edge, out float along, out vec2 inward) {
+  vec2 corner = min(px, vec2(1280.0, 720.0) - px);
+  edge = min(corner.x, corner.y);
+  if (corner.y < corner.x) { along = px.x; inward = vec2(0.0, px.y < 360.0 ? 1.0 : -1.0); }
+  else { along = px.y; inward = vec2(px.x < 640.0 ? 1.0 : -1.0, 0.0); }
+}
+
+// An orc war camp: round timber logs bound with iron, iron spikes, bone tusks and red-and-black banners.
+vec3 warband_frame(vec2 px, float edge, float along, vec2 inward) {
+  float u = edge / 16.0 - 1.0;  // across the log, -1 at its outer side
+  vec2 side = abs(inward.yx);
+  float band = mod(along, 160.0) - 80.0;
+  if (abs(band) < 9.0) {  // an iron band around the log, riveted through
+    vec2 rivet = (side * band + inward * (edge - 16.0)) / 4.5;
+    if (dot(rivet, rivet) < 1.0) return shade(vec3(0.3, 0.28, 0.26), dome(rivet), 40.0, 0.7);
+    vec3 n = normalize(roll(inward, u) + vec3(side * band / 9.0 * 0.6, 0.0));
+    return shade(vec3(0.16, 0.14, 0.13) * (0.7 + 0.5 * fbm(px * 0.05)), n, 24.0, 0.35);
+  }
+  vec3 wood = vec3(0.32, 0.18, 0.09) * (0.5 + 0.8 * fbm(vec2(along * 0.02, edge * 0.35)));
+  wood *= 1.0 - 0.4 * smoothstep(0.58, 0.7, fbm(vec2(along * 0.05, edge * 0.6) + 7.0));  // cracks in the bark
+  return shade(wood, roll(inward, u), 12.0, 0.05);
+}
+// A tusk curving in from a corner: q in pixels from that corner, flip turns it into screen directions.
+vec4 warband_tusk(vec2 q, vec2 flip) {
   vec2 v = q - vec2(40.0, 160.0);
   float t = (atan(v.y, v.x) + 1.5708) / 1.0472;
   float w = 14.0 * (1.0 - t), d = length(v) - 120.0;
   if (t < 0.0 || t > 1.0 || abs(d) > w) return vec4(0.0);
-  if (t < 0.12) return vec4(vec3(0.3, 0.18, 0.1) * (0.75 + 0.4 * step(0.5, fract(t * 50.0))), 1.0);
-  return vec4(vec3(0.86, 0.8, 0.66) * mix(1.15, 0.5, d / w * 0.5 + 0.5), 1.0);
+  vec3 n = roll(normalize(v) * flip, d / w);
+  if (t < 0.12) return vec4(shade(vec3(0.32, 0.19, 0.1) * (0.75 + 0.4 * step(0.5, fract(t * 50.0))), n, 8.0, 0.05), 1.0);  // leather wrap
+  return vec4(shade(mix(vec3(0.78, 0.68, 0.5), vec3(0.95, 0.92, 0.82), t), n, 30.0, 0.4), 1.0);
 }
-vec3 warband_banner(vec2 b, float side) {  // b runs 0 to 1 across and down the banner
+vec2 banner_at(vec2 uv, float s) {  // 0 to 1 across and down each banner; they sway more lower down
+  float sway = sin(time * 1.4 + s * 2.0) * 0.006 * uv.y;
+  return vec2((uv.x - mix(0.13, 0.79, s) - sway) / 0.08, (uv.y - 0.044) / 0.4);
+}
+bool banner_cloth(vec2 b, float s) {
+  float tear = 0.1 * abs(b.x - 0.5) + 0.03 * barn_noise(vec2(floor(b.x * 14.0), s));
+  return b.x > 0.0 && b.x < 1.0 && b.y > 0.0 && b.y < 0.86 + tear;
+}
+bool banner_rod(vec2 b) { return b.y > 0.0 && b.y < 0.035 && abs(b.x - 0.5) < 0.62; }
+vec3 warband_banner(vec2 b, float side) {
   float cloth = fbm(vec2(b.x * 6.0 + side * 9.0, b.y * 30.0));
-  vec3 c = vec3(0.5, 0.04, 0.03) * (0.7 + 0.6 * cloth) * (0.85 + 0.2 * cos(b.x * 18.85));  // folds
+  vec3 n = normalize(vec3(sin(b.x * 18.85) * 0.5, 0.12 * sin(b.y * 9.0 + side), 1.0));  // folds
+  vec3 c = vec3(0.6, 0.05, 0.035) * (0.75 + 0.5 * cloth);
   float chevron = b.y - (0.45 + abs(b.x - 0.5) * 0.7);
-  if (b.x < 0.09 || b.x > 0.91 || (chevron > 0.0 && chevron < 0.08)) c = vec3(0.06, 0.05, 0.05) * (0.8 + 0.5 * cloth);
-  return c * mix(1.0, 0.6, b.y);
+  if (b.x < 0.09 || b.x > 0.91 || (chevron > 0.0 && chevron < 0.08)) c = vec3(0.07, 0.06, 0.06) * (0.8 + 0.5 * cloth);
+  if (b.y < 0.12) c = vec3(0.5, 0.34, 0.2) * (0.7 + 0.5 * fbm(b * vec2(40.0, 60.0) + side));  // a hide top, stitched on
+  if (abs(b.y - 0.11) < 0.005 && fract(b.x * 12.0) < 0.5) c = vec3(0.12, 0.08, 0.05);
+  return shade(c, n, 6.0, 0.03) * mix(1.0, 0.7, b.y);
+}
+bool warband_spike(float edge, float along) {
+  float spike = 1.0 - (edge - 32.0) / 26.0;
+  return spike > 0.0 && abs(mod(along, 80.0) - 40.0) < 9.0 * spike;
+}
+float warband_solid(vec2 px) {  // anything in front of the picture, for the shadows it casts
+  float edge, along; vec2 inward;
+  frame_axes(px, edge, along, inward);
+  if (edge < 32.0 || warband_spike(edge, along)) return 1.0;
+  if (warband_tusk(min(px, vec2(1280.0, 720.0) - px), vec2(1.0)).a > 0.0) return 1.0;
+  for (float s = 0.0; s < 2.0; s += 1.0) {
+    vec2 b = banner_at(px / vec2(1280.0, 720.0), s);
+    if (banner_cloth(b, s) || banner_rod(b)) return 1.0;
+  }
+  return 0.0;
 }
 vec3 warband(vec2 uv) {
   vec2 px = uv * vec2(1280.0, 720.0);
+  float edge, along; vec2 inward;
+  frame_axes(px, edge, along, inward);
+  vec2 flip = vec2(px.x < 640.0 ? 1.0 : -1.0, px.y < 360.0 ? 1.0 : -1.0);
   vec2 corner = min(px, vec2(1280.0, 720.0) - px);
-  float edge = min(corner.x, corner.y);
-  float along = corner.y < corner.x ? px.x : px.y;
-  vec4 tusk = warband_tusk(corner);
+  vec4 tusk = warband_tusk(corner, flip);
   if (tusk.a > 0.0) return tusk.rgb;
-  if (edge < 32.0) return warband_frame(px, edge, along);
-  for (float s = 0.0; s < 2.0; s += 1.0) {  // banners hang from wooden rods, swaying more lower down
-    float sway = sin(time * 1.4 + s * 2.0) * 0.006 * uv.y;
-    vec2 b = vec2((uv.x - mix(0.13, 0.79, s) - sway) / 0.08, (uv.y - 0.044) / 0.4);
-    if (b.y > 0.0 && b.y < 0.035 && abs(b.x - 0.5) < 0.62) return vec3(0.28, 0.16, 0.08) * (0.6 + 0.6 * fbm(px * 0.2));
-    float tear = 0.1 * abs(b.x - 0.5) + 0.03 * barn_noise(vec2(floor(b.x * 14.0), s));
-    if (b.x > 0.0 && b.x < 1.0 && b.y > 0.0 && b.y < 0.86 + tear) return warband_banner(b, s);
+  if (max(corner.x, corner.y) < 34.0) {  // rope lashed around each corner, where the logs meet
+    float wrap = fract((corner.x + corner.y) / 7.0);
+    vec3 rope = vec3(0.58, 0.45, 0.27) * (0.75 + 0.4 * fbm(px * 0.4));
+    return shade(rope, roll(normalize(flip), wrap * 2.0 - 1.0), 10.0, 0.05) * mix(0.55, 1.0, smoothstep(0.0, 0.15, wrap) * smoothstep(1.0, 0.85, wrap));
   }
-  float spike = 1.0 - (edge - 32.0) / 26.0;  // iron spikes along the inside of the frame
-  float sx = mod(along, 80.0) - 40.0;
-  if (spike > 0.0 && abs(sx) < 9.0 * spike) return vec3(0.1, 0.09, 0.09) * mix(0.6, 1.6, step(0.0, sx)) * (0.7 + 0.5 * spike);
+  if (edge < 32.0) return warband_frame(px, edge, along, inward);
+  for (float s = 0.0; s < 2.0; s += 1.0) {
+    vec2 b = banner_at(uv, s);
+    if (banner_rod(b)) return shade(vec3(0.3, 0.17, 0.08) * (0.6 + 0.6 * fbm(px * 0.2)), roll(vec2(0.0, 1.0), b.y / 0.0175 - 1.0), 12.0, 0.08);
+    if (banner_cloth(b, s)) return warband_banner(b, s);
+  }
+  if (warband_spike(edge, along)) {
+    float sx = (mod(along, 80.0) - 40.0) / (9.0 * (1.0 - (edge - 32.0) / 26.0));
+    return shade(vec3(0.17, 0.16, 0.16), normalize(roll(abs(inward.yx), sx) + vec3(inward * 0.35, 0.0)), 40.0, 0.55);
+  }
 
-  vec3 c = clamp(get(uv), 0.0, 1.0);
+  // Heat shimmer rising off the fire below.
+  vec3 c = clamp(get(uv + vec2(sin(uv.y * 90.0 - time * 7.0) * 0.0015 * smoothstep(0.6, 1.0, uv.y), 0.0)), 0.0, 1.0);
   float l = luma(c);
   c = mix(vec3(l), c, 0.55);
   c = c * c * (3.0 - 2.0 * c);
@@ -660,6 +748,7 @@ vec3 warband(vec2 uv) {
   float flicker = 0.85 + 0.15 * sin(time * 9.0) * sin(time * 5.3);
   c += vec3(0.55, 0.16, 0.02) * smoothstep(0.55, 1.0, uv.y) * 0.45 * flicker;  // firelight from below
   c *= mix(0.55, 1.0, vignette(uv, 1.1));
+  c *= 1.0 - 0.3 * (warband_solid(px + vec2(-7.0, -9.0)) + warband_solid(px + vec2(-13.0, -16.0)));  // soft cast shadows
   for (float layer = 1.0; layer < 3.0; layer += 1.0) {  // embers rising from the fire
     vec2 p = uv * vec2(14.0, 8.0) * layer + vec2(sin(time * 0.9 + uv.y * 5.0 + layer) * 0.25, time * 1.6 * layer);
     vec2 cell = floor(p);
@@ -669,30 +758,80 @@ vec3 warband(vec2 uv) {
   }
   return c;
 }
-// An early-2000s fantasy game: earthy brown stone, a dark wooden bevel and chunky blocks of colour.
-vec3 castle_stone(vec2 px, float edge, float along) {
+
+// An early-2000s fantasy castle: carved brown stone with moss, a rounded wooden moulding, brass studs, and a light mystic haze.
+vec3 castle_stone(vec2 px, float edge, float along, vec2 inward) {
   float row = floor(edge / 20.0);
   float bx = along + row * 27.0;  // each course of blocks is offset by half a block
   vec2 f = vec2(mod(bx, 54.0), mod(edge, 20.0));
+  vec2 cell = vec2(floor(bx / 54.0), row);
+  vec2 bevel = vec2(smoothstep(6.0, 0.0, f.x) - smoothstep(6.0, 0.0, 54.0 - f.x),
+                    smoothstep(5.0, 0.0, f.y) - smoothstep(5.0, 0.0, 20.0 - f.y));  // carved block edges
+  vec2 bump = vec2(fbm(px * 0.12), fbm(px * 0.12 + 31.0)) - 0.5;
+  vec3 n = normalize(vec3(-(abs(inward.yx) * bevel.x + inward * bevel.y) * 0.8 + bump * 0.7, 1.0));
+  vec3 stone = vec3(0.47, 0.41, 0.33) * (0.72 + 0.32 * barn_noise(cell)) * (0.8 + 0.3 * fbm(px * 0.09));
+  stone = mix(stone, vec3(0.26, 0.33, 0.18), 0.6 * smoothstep(0.6, 0.78, fbm(px * 0.03 + cell)));  // moss
   float mortar = min(min(f.x, 54.0 - f.x), min(f.y, 20.0 - f.y));
-  vec3 stone = vec3(0.42, 0.37, 0.3) * (0.72 + 0.32 * barn_noise(vec2(floor(bx / 54.0), row))) * (0.75 + 0.4 * fbm(px * 0.09));
-  return stone * mix(0.4, 1.0, smoothstep(0.5, 2.5, mortar)) * mix(1.1, 0.8, (px.x / 1280.0 + px.y / 720.0) * 0.5);
+  return shade(stone, n, 10.0, 0.05) * mix(0.25, 1.0, smoothstep(0.5, 2.5, mortar));
+}
+float torch_flicker(float s) { return 0.8 + 0.2 * sin(time * 11.0 + s * 3.0) * sin(time * 7.3 + s); }
+vec3 torch_light(vec2 px) {  // warm light from both wall torches, falling off with distance
+  vec3 light = vec3(0.0);
+  for (float s = 0.0; s < 2.0; s += 1.0) {
+    vec2 d = (px - vec2(mix(20.0, 1260.0, s), 300.0)) / 220.0;
+    light += vec3(1.0, 0.55, 0.2) * torch_flicker(s) / (1.0 + dot(d, d) * 4.0);
+  }
+  return light;
+}
+vec4 wall_torch(vec2 px) {  // an iron sconce on each side of the frame, with a flame licking upward
+  for (float s = 0.0; s < 2.0; s += 1.0) {
+    vec2 b = px - vec2(mix(20.0, 1260.0, s), 340.0);
+    vec3 iron = vec3(0.12, 0.11, 0.1);
+    if (abs(b.x) < 10.0 && b.y > 0.0 && b.y < 18.0) return vec4(shade(iron, roll(vec2(1.0, 0.0), b.x / 10.0), 30.0, 0.5), 1.0);
+    if (abs(b.x) < 3.0 && b.y >= 18.0 && b.y < 50.0) return vec4(shade(iron, roll(vec2(1.0, 0.0), b.x / 3.0), 30.0, 0.4), 1.0);
+    vec2 f = vec2(b.x / 15.0, -b.y / 60.0);  // f.y runs from 0 at the cup to 1 at the tip
+    float width = f.y < 0.0 ? sqrt(max(1.0 - f.y * f.y / 0.0225, 0.0)) : 1.0 - f.y;
+    float inside = width - abs(f.x) + (fbm(vec2(f.x * 2.0, f.y * 3.0 - time * 3.5) + s * 5.0) - 0.5) * 0.6 * max(f.y, 0.0);
+    if (f.y > -0.15 && f.y < 1.0 && inside > 0.0) {
+      float heat = clamp(inside * 2.5 * (1.0 - f.y * 0.6), 0.0, 1.0);
+      vec3 flame = mix(vec3(0.8, 0.15, 0.02), vec3(1.0, 0.6, 0.1), smoothstep(0.0, 0.4, heat));
+      return vec4(mix(flame, vec3(1.0, 0.95, 0.7), smoothstep(0.5, 1.0, heat)) * (0.9 + 0.2 * torch_flicker(s)), 1.0);
+    }
+  }
+  return vec4(0.0);
 }
 vec3 old_quest(vec2 uv) {
   vec2 px = uv * vec2(1280.0, 720.0);
-  vec2 corner = min(px, vec2(1280.0, 720.0) - px);
-  float edge = min(corner.x, corner.y);
-  float stud = length(corner - vec2(43.0));
-  if (stud < 15.0) return vec3(0.72, 0.56, 0.25) * mix(1.3, 0.5, stud / 15.0);  // brass studs at the corners
-  if (edge < 40.0) return castle_stone(px, edge, corner.y < corner.x ? px.x : px.y);
-  if (edge < 47.0) return vec3(0.22, 0.15, 0.08) * mix(1.5, 0.6, abs(edge - 42.0) / 5.0);  // dark wooden bevel
+  float edge, along; vec2 inward;
+  frame_axes(px, edge, along, inward);
+  vec2 flip = vec2(px.x < 640.0 ? 1.0 : -1.0, px.y < 360.0 ? 1.0 : -1.0);
+  vec2 stud = (min(px, vec2(1280.0, 720.0) - px) - vec2(43.0)) / 15.0;
+  if (dot(stud, stud) < 1.0) return shade(vec3(0.7, 0.52, 0.22), dome(stud * flip), 40.0, 0.8);
+  vec4 torch = wall_torch(px);
+  if (torch.a > 0.0) return torch.rgb;
+  vec3 light = torch_light(px);
+  if (edge < 40.0) return castle_stone(px, edge, along, inward) * (1.0 + light * 0.7);
+  if (edge < 47.0) return shade(vec3(0.3, 0.19, 0.09) * (0.8 + 0.4 * fbm(vec2(along * 0.03, edge))), roll(inward, (edge - 43.5) / 3.5), 20.0, 0.15) * (1.0 + light * 0.5);
 
-  vec2 grid = vec2(320.0, 180.0);
-  vec3 c = clamp(get((floor(uv * grid) + 0.5) / grid), 0.0, 1.0);
-  c = clamp(mix(vec3(luma(c)), c, 1.15), 0.0, 1.0);
-  c = floor(c * 8.0 + 0.5) / 8.0 * vec3(1.05, 1.0, 0.86);  // flat, earthy blocks of colour
-  float torch = 1.0 + 0.04 * sin(time * 7.0) + 0.03 * sin(time * 12.7);
-  return c * torch * mix(0.5, 1.0, smoothstep(47.0, 80.0, edge));  // shadow cast by the frame
+  vec3 c = clamp(get(uv), 0.0, 1.0);
+  c = mix(vec3(luma(c)), c, 1.08) * vec3(1.04, 1.0, 0.94) + bloom(uv, 9.0, 0.7) * vec3(0.9, 0.85, 1.0) * 0.5;
+  c *= mix(0.45, 1.0, smoothstep(47.0, 72.0, frame_edge(px + vec2(-8.0, -10.0))));  // the frame's cast shadow
+  c += c * light * 0.15;
+  // Mist drifting in two layers, thicker towards the frame so the face stays clear.
+  float mist = fbm(uv * vec2(3.0, 2.2) + vec2(time * 0.035, time * 0.012)) * 0.6
+             + fbm(uv * vec2(5.0, 3.5) - vec2(time * 0.02, time * 0.03) + 17.0) * 0.4;
+  float haze = smoothstep(0.28, 0.72, mist) * mix(0.35, 0.9, 1.0 - vignette(uv, 1.8));
+  vec3 tint = mix(vec3(0.6, 0.8, 0.9), vec3(0.85, 0.72, 1.0), fbm(uv * 1.5 + time * 0.02));
+  c = 1.0 - (1.0 - c) * (1.0 - tint * haze * 0.6);  // screen blend: the haze lightens without hiding the face
+  for (float layer = 1.0; layer < 3.0; layer += 1.0) {  // twinkling motes
+    vec2 p = uv * vec2(18.0, 10.0) * layer + vec2(sin(time * 0.3 + layer + uv.y * 3.0) * 0.4, time * 0.12 * layer);
+    vec2 cell = floor(p);
+    vec2 centre = vec2(barn_noise(cell), barn_noise(cell + 5.0)) * 0.6 + 0.2;
+    float twinkle = 0.5 + 0.5 * sin(time * 3.0 + barn_noise(cell + 9.0) * 6.283);
+    float glint = smoothstep(0.06, 0.0, length(fract(p) - centre)) * step(0.85, barn_noise(cell + layer * 7.0)) * twinkle;
+    c += mix(vec3(1.0, 0.9, 0.6), vec3(0.7, 0.9, 1.0), barn_noise(cell + 2.0)) * glint * 0.6 * (1.0 - 0.6 * vignette(uv, 1.2));
+  }
+  return c;
 }
 
 void main() {
@@ -778,10 +917,15 @@ VOICE_CHAIN = (
     'appsrc name=shifter_out is-live=true format=time do-timestamp=true '
     'caps="audio/x-raw,format=F32LE,channels=1,rate=48000,layout=interleaved" '
     "! audiocheblimit name=highpass mode=high-pass poles=4 ! audiocheblimit name=lowpass mode=low-pass poles=4 "
+    # Compression and the mid boost before drive: drive adds back the level and grit, and its clip keeps it in range.
+    # audiodynamic works per sample, with no attack or release, so above its threshold it also adds a little grit.
+    "! audiodynamic name=compress characteristics=hard-knee mode=compressor ! equalizer-nbands name=presence num-bands=1 "
     "! audioamplify name=drive clipping-method=clip ! audioecho name=echo max-delay=500000000 "
     "! freeverb name=reverb room-size=0.85 ! audioconvert ! audio/x-raw,format=F32LE,channels=2,rate=48000"
 )
 # Each voice lists only what differs from set_voice's defaults. echo: delay ms, intensity, feedback.
+# compress: threshold, ratio. presence: a mid boost, Hz and dB. mod: Hz and depth, where depth 1 is ring
+# modulation (the Dalek sound) and a small depth at a few Hz is tremolo. static: noise level, band-limited by the filters.
 # formant moves the voice's resonance: left out it follows pitch, which is what makes Chipmunk sound
 # small. Child and Female keep it lower than pitch so they read as a person, not sped-up tape.
 VOICES = {
@@ -791,16 +935,18 @@ VOICES = {
     "Child": {"pitch": 1.7, "formant": 1.3, "highpass": 150.0},
     "Female": {"pitch": 1.5, "formant": 1.15, "highpass": 120.0},
     "Male": {"pitch": 0.8, "formant": 0.9, "highpass": 80.0},
-    "Robot": {"pitch": 0.92, "echo": (12, 0.7, 0.6)},
-    "Walkie-Talkie": {"highpass": 400.0, "lowpass": 2800.0, "drive": 3.0},
-    "Cave": {"echo": (180, 0.45, 0.45), "reverb": 0.45},
-    "Demon": {"pitch": 0.62, "reverb": 0.3},
-    "Alien": {"pitch": 1.2, "formant": 0.7, "echo": (10, 0.5, 0.45), "drive": 1.3},
-    "Ghost": {"pitch": 1.06, "formant": 1.15, "highpass": 250.0, "echo": (260, 0.4, 0.4), "reverb": 0.55},
-    "Ghostface": {"pitch": 0.78, "formant": 0.85, "highpass": 120.0, "lowpass": 4000.0, "drive": 1.8, "echo": (8, 0.35, 0.3)},
-    # Resonance below pitch gives a huge chest; the drive growls on loud words only.
-    "Orc Warlord": {"pitch": 0.78, "formant": 0.68, "lowpass": 5000.0, "drive": 2.0, "reverb": 0.15},
-    "Adventurer": {"pitch": 1.1, "formant": 1.0, "highpass": 100.0, "reverb": 0.2},
+    "Robot": {"mod": (50.0, 0.85), "compress": (0.3, 4.0), "drive": 1.2, "echo": (12, 0.7, 0.6)},
+    "Walkie-Talkie": {"highpass": 400.0, "lowpass": 2700.0, "presence": (1500.0, 4.0), "compress": (0.25, 6.0), "drive": 1.2,
+                      "static": 0.015},
+    "Cave": {"lowpass": 5000.0, "echo": (180, 0.45, 0.45), "reverb": 0.45},  # a dark reverb reads as stone
+    "Demon": {"pitch": 0.67, "formant": 0.62, "lowpass": 6000.0, "compress": (0.3, 4.0), "drive": 1.6, "reverb": 0.5},
+    "Alien": {"pitch": 1.2, "formant": 0.7, "mod": (300.0, 0.35), "drive": 2.4, "reverb": 0.3},
+    "Ghost": {"pitch": 1.06, "formant": 1.15, "highpass": 250.0, "mod": (5.0, 0.3), "drive": 1.5, "echo": (260, 0.4, 0.4), "reverb": 0.55},
+    # A slight drop and rasp through a phone band: the film voice isn't demon-deep.
+    "Ghostface": {"pitch": 0.87, "formant": 0.85, "highpass": 300.0, "lowpass": 3400.0, "compress": (0.3, 4.0), "drive": 1.2},
+    # Resonance below pitch gives a huge chest; compression and drive growl on loud words.
+    "Orc Warlord": {"pitch": 0.78, "formant": 0.68, "lowpass": 5000.0, "compress": (0.3, 4.0), "drive": 1.3, "reverb": 0.15},
+    "Adventurer": {"pitch": 1.1, "formant": 1.0, "highpass": 100.0, "drive": 1.25, "reverb": 0.2},
 }
 RUBBERBAND_MISSING = "This voice needs the Rubber Band library, so it sounds like Normal. Open Setup & Help (F1) to fix it."
 MIC_LOST = f"No sound is reaching {APP_NAME} from your mic. Check it's plugged in."
@@ -830,6 +976,7 @@ class PitchShifter:
 
     def __init__(self):
         self.wanted = self.applied = (1.0, 1.0)
+        self.mod, self.static, self.phase = (0.0, 0.0), 0.0, 0.0
         lib = self.lib = load_rubberband()
         if lib is None:
             return  # pitch voices pass audio through unchanged, and the app says why
@@ -851,11 +998,27 @@ class PitchShifter:
         self.output_ptr = (ctypes.c_void_p * 1)(ctypes.addressof(self.output))
         self.wanted = self.applied = (1.0, 1.0)
 
-    def want(self, pitch, formant):
+    def want(self, pitch, formant, mod=(0.0, 0.0), static=0.0):
         # Applied by process(): rubberband isn't safe to change from another thread mid-block.
         self.wanted = (pitch, formant)
+        self.mod, self.static = mod, static
 
     def process(self, data):
+        data = self.shift(data)
+        return self.colour(data) if data and (self.mod[1] or self.static) else data
+
+    def colour(self, data):
+        """Ring modulation or tremolo, and static: GStreamer has no element for these, and they're cheap per sample."""
+        samples = array.array("f", data)
+        (hz, depth), static, phase = self.mod, self.static, self.phase
+        step = 2 * math.pi * hz / 48000
+        for i, x in enumerate(samples):
+            samples[i] = x * (1 - depth + depth * math.sin(phase)) + static * (2 * random.random() - 1)
+            phase += step
+        self.phase = phase % (2 * math.pi)
+        return samples.tobytes()
+
+    def shift(self, data):
         if self.lib is None:
             return data
         pitch, formant = self.wanted
@@ -904,7 +1067,15 @@ def set_voice(pipeline, name):
     voice = VOICES[name]
     delay_ms, intensity, feedback = voice.get("echo", (1, 0.0, 0.0))
     pitch = voice.get("pitch", 1.0)
-    pipeline.shifter.want(pitch, voice.get("formant", pitch))
+    pipeline.shifter.want(pitch, voice.get("formant", pitch), voice.get("mod", (0.0, 0.0)), voice.get("static", 0.0))
+    threshold, ratio = voice.get("compress", (1.0, 1.0))
+    pipeline.get_by_name("compress").set_property("threshold", threshold)
+    pipeline.get_by_name("compress").set_property("ratio", 1 / ratio)  # audiodynamic wants the slope: 4:1 is 0.25
+    hz, db = voice.get("presence", (1000.0, 0.0))
+    band = pipeline.get_by_name("presence").get_child_by_index(0)
+    band.set_property("freq", hz)
+    band.set_property("bandwidth", hz)
+    band.set_property("gain", db)
     pipeline.get_by_name("highpass").set_property("cutoff", voice.get("highpass", 20.0))
     pipeline.get_by_name("lowpass").set_property("cutoff", voice.get("lowpass", 20000.0))
     pipeline.get_by_name("drive").set_property("amplification", voice.get("drive", 1.0))
@@ -1490,14 +1661,15 @@ class RedbarnStudio(Adw.Application):
     def start(self):
         self.stop_camera()  # Try Again after an error: the old pipeline still holds the devices
         cam, loopback = find_webcam(), find_loopback()
+        if loopback:  # named even before a webcam is plugged in
+            self.camera_group.set_description(f"Select '{GLib.markup_escape_text(loopback[1])}' as your camera source.")
         if not cam:
             self.camera_off("No webcam found. Plug it in, then click Try Again.")
             return
         if not loopback:
             self.camera_off("The virtual camera isn't set up. Setup & Help shows how to add it.")
             return
-        loopback_path, loopback_name = loopback
-        self.camera_group.set_description(f"Select '{GLib.markup_escape_text(loopback_name)}' as your camera source.")
+        loopback_path = loopback[0]
         try:
             self.pipeline = build_camera_pipeline(cam, loopback_path)
         except GLib.Error as e:
@@ -1809,7 +1981,7 @@ class RedbarnStudio(Adw.Application):
 
 
 def pull_bytes(sink):
-    sample = sink.emit("try-pull-sample", 2 * Gst.SECOND)
+    sample = sink.emit("try-pull-sample", 15 * Gst.SECOND)  # a new pipeline compiles the shader first: slow on software GL
     assert sample, "no frame arrived"
     buffer = sample.get_buffer()
     ok, info = buffer.map(Gst.MapFlags.READ)
@@ -1867,6 +2039,15 @@ def peak(samples):
     return max(abs(x) for x in samples)
 
 
+def power_at(samples, frequency):
+    """Goertzel: the energy of samples at one frequency."""
+    step = 2 * math.cos(2 * math.pi * frequency / 48000)
+    a = b = 0.0
+    for x in samples:
+        a, b = x + step * a - b, a
+    return a * a + b * b - step * a * b
+
+
 def check_voices():
     """Synthetic tone only: no mic or virtual devices are touched."""
     pipeline = Gst.parse_launch(
@@ -1888,8 +2069,8 @@ def check_voices():
     if not pitched:
         print("Rubber Band isn't installed: skipping the pitch voices")
     for name, expected in (("Normal", 440), ("Deep", 330), ("Chipmunk", 704), ("Child", 748), ("Female", 660),
-                           ("Male", 352), ("Robot", 405), ("Demon", 273), ("Alien", 528), ("Ghost", 466),
-                           ("Ghostface", 343), ("Orc Warlord", 343), ("Adventurer", 484), ("Normal", 440)):
+                           ("Male", 352), ("Ghost", 466), ("Demon", 295),  # Ghost first: Demon's long reverb tail would skew it
+                           ("Ghostface", 383), ("Orc Warlord", 343), ("Adventurer", 484), ("Normal", 440)):
         if not pitched and "pitch" in VOICES[name]:
             continue
         measured = tone_frequency(voice_at(name))
@@ -1900,9 +2081,38 @@ def check_voices():
         normal, radio = peak(voice_at("Normal", frequency)), peak(voice_at("Walkie-Talkie", frequency))
         print(f"Walkie-Talkie  {frequency}Hz: {radio:.3f} vs Normal {normal:.3f}")
         if frequency == 1000:
-            assert radio > normal, "Walkie-Talkie lost the speech band"
+            assert normal < radio <= 1.0, "Walkie-Talkie lost the speech band, or clips past full scale"
         else:
             assert radio < normal * 0.25, "Walkie-Talkie isn't narrowing the sound"
+
+    robot = voice_at("Robot")
+    sidebands, carrier = power_at(robot, 390) + power_at(robot, 490), power_at(robot, 440)
+    print(f"Robot ring modulation: 390+490Hz {sidebands:.0f} vs 440Hz {carrier:.0f}")
+    assert sidebands > 2 * carrier, "Robot isn't ring-modulated"
+    alien = voice_at("Alien")
+    shifted, sidebands, original = power_at(alien, 528), power_at(alien, 228) + power_at(alien, 828), power_at(alien, 440)
+    print(f"Alien: 528Hz {shifted:.0f}, ring sidebands {sidebands:.0f}, unshifted 440Hz {original:.0f}")
+    assert shifted > sidebands > 3 * original, "Alien isn't pitched up with a ring-modulated edge"
+
+    ghost = voice_at("Ghost")
+    envelope = [peak(ghost[i:i + 960]) for i in range(0, len(ghost) - 960, 960)]
+    print(f"Ghost tremolo: loudest {max(envelope):.3f} vs quietest {min(envelope):.3f}")
+    assert max(envelope) > 1.5 * min(envelope), "Ghost doesn't pulse"
+
+    tone.set_property("volume", 0.1)
+    quiet = peak(voice_at("Walkie-Talkie", 1000))
+    tone.set_property("volume", 0.4)
+    loud = peak(voice_at("Walkie-Talkie", 1000))
+    print(f"Walkie-Talkie compression: 4x louder input comes out {loud / quiet:.1f}x louder")
+    assert loud / quiet < 3.0, "Walkie-Talkie isn't compressed"
+
+    floors = {}
+    tone.set_property("volume", 0.0)
+    for name in ("Normal", "Walkie-Talkie"):
+        floors[name] = peak(voice_at(name, 1000))
+    tone.set_property("volume", 0.4)
+    print(f"Silence: Walkie-Talkie static {floors['Walkie-Talkie']:.4f}, Normal {floors['Normal']:.4f}")
+    assert floors["Walkie-Talkie"] > 0.005 > floors["Normal"], "Walkie-Talkie has no static, or Normal does"
 
     tails = {}
     for name in ("Normal", "Cave", "Ghost"):
@@ -1931,12 +2141,7 @@ def resonance_centre(name):
     # Measured on the shifted voice's own harmonics: a fixed grid misses them and skews the result.
     f0 = 120 * voice.get("pitch", 1.0)
     bands = []
-    for frequency in (f0 * k for k in range(1, int(3000 / f0))):
-        step = 2 * math.cos(2 * math.pi * frequency / 48000)
-        a = b = 0.0
-        for x in samples:
-            a, b = x + step * a - b, a
-        bands.append((frequency, a * a + b * b - step * a * b))
+    bands = [(frequency, power_at(samples, frequency)) for frequency in (f0 * k for k in range(1, int(3000 / f0)))]
     return sum(f * p for f, p in bands) / sum(p for _, p in bands)
 
 
@@ -1966,9 +2171,9 @@ def colour_bars(look):
     return pipeline, pipeline.get_by_name("sink")
 
 
-def check_game_looks():
+def check_look_details():
     frames = {}
-    for name in ("Warband", "Old Quest"):
+    for name in ("Warband", "Old Quest", "VHS", "Thermal"):
         pipeline, sink = colour_bars(name)
         pipeline.set_state(Gst.State.PLAYING)
         time.sleep(0.4)
@@ -1988,13 +2193,28 @@ def check_game_looks():
     assert mean(timber) < 90 and mean(timber, 0) > 1.5 * mean(timber, 2), "Warband has no timber frame"
     assert sum(min(p) > 120 for p in tusk) > len(tusk) * 0.2, "Warband has no bone tusks"
     assert embers > 0.02, "Warband embers aren't moving"
+    rope = pixels(camp, 8, 24, 8, 24)
+    print(f"Warband rope: {mean(rope, 0):.0f}/{mean(rope, 1):.0f}/{mean(rope, 2):.0f}")
+    assert mean(rope) > mean(timber) and mean(rope, 0) > 1.4 * mean(rope, 2), "Warband has no rope lashings"
 
     castle = frames["Old Quest"][0]
-    stone, bevel = pixels(castle, 4, 36, 200, 500), pixels(castle, 41, 46, 200, 500)
+    stone, bevel = pixels(castle, 4, 36, 520, 650), pixels(castle, 41, 46, 520, 650)  # below the torch's warm light
     print(f"Old Quest: stone {mean(stone):.0f} (red-blue {mean(stone, 0) - mean(stone, 2):.0f}), "
           f"bevel {mean(bevel, 0):.0f}/{mean(bevel, 1):.0f}/{mean(bevel, 2):.0f}")
     assert 40 < mean(stone) < 160 and 0 < mean(stone, 0) - mean(stone, 2) < 50, "Old Quest has no brown stone frame"
     assert mean(bevel) < mean(stone) and mean(bevel, 0) > 1.5 * mean(bevel, 2), "Old Quest has no wooden bevel"
+    flame = pixels(castle, 16, 24, 316, 330)
+    print(f"Old Quest torch flame: {mean(flame, 0):.0f}/{mean(flame, 1):.0f}/{mean(flame, 2):.0f}")
+    assert mean(flame, 0) > 200 and mean(flame, 0) > 1.3 * mean(flame, 2), "Old Quest has no bright, warm torch flame"
+
+    tape = frames["VHS"][0]
+    smear = tape[(360 * 1280 + 372) * 4]
+    print(f"VHS: red smeared {smear} into the cyan bar after yellow")
+    assert smear > 30, "VHS colour doesn't trail to the right"
+    heat = frames["Thermal"][0]
+    top, bottom = heat[(165 * 1280 + 1230) * 4:(165 * 1280 + 1230) * 4 + 3], heat[(555 * 1280 + 1230) * 4:(555 * 1280 + 1230) * 4 + 3]
+    print(f"Thermal scale bar: top {tuple(top)}, bottom {tuple(bottom)}")
+    assert min(top) > 200 and max(bottom) < 40, "Thermal scale bar doesn't run from white-hot to black"
 
 
 def check_red_barn():
@@ -2202,7 +2422,7 @@ def self_test():
     assert mean(clean[:len(clean) // 2]) < mean(clean[len(clean) // 2:]), "image is upside down"
     check_picture_not_mirrored()
     check_red_barn()
-    check_game_looks()
+    check_look_details()
     assert len(LOOKS) == len(VOICES), "Looks and voices should stay equal in number"
     check_voices()
     check_formants()

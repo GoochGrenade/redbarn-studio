@@ -55,6 +55,7 @@ jobs:
           pip install -q --break-system-packages --no-build-isolation ./pyvirtualcam
           python -c "import pyvirtualcam; print('pyvirtualcam', pyvirtualcam.__version__)"
       - name: Self-test
+        timeout-minutes: 15  # a failed GStreamer test can leave the process hanging instead of exiting
         # The server has no GPU, so Mesa's software renderer stands in. Mesa's opengl32.dll sits next to
         # python.exe here; a packaged app must not ship it, or it would override users' graphics drivers.
         env:
@@ -80,6 +81,7 @@ jobs:
           du -sh "dist/Redbarn Studio"
           echo "Mesa OpenGL files in the package (should be none):"; find "dist/Redbarn Studio" -iname "opengl32.dll" -o -iname "libgallium_wgl.dll"
       - name: Test the package
+        timeout-minutes: 15
         # A copy gets Mesa, because the server has no GPU; the download itself never does.
         run: |
           cp -r "dist/Redbarn Studio" pkgtest
