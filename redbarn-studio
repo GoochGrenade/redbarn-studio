@@ -925,7 +925,8 @@ VOICE_CHAIN = (
 )
 # Each voice lists only what differs from set_voice's defaults. echo: delay ms, intensity, feedback.
 # compress: threshold, ratio. presence: a mid boost, Hz and dB. mod: Hz and depth, where depth 1 is ring
-# modulation (the Dalek sound) and a small depth at a few Hz is tremolo. static: noise level, band-limited by the filters.
+# modulation (the Dalek sound) and a small depth at a few Hz is tremolo. static: noise level, band-limited by the filters,
+# that opens while you talk and dies away just after, like a radio's squelch: never constant hiss in silence.
 # formant moves the voice's resonance: left out it follows pitch, which is what makes Chipmunk sound
 # small. Child and Female keep it lower than pitch so they read as a person, not sped-up tape.
 VOICES = {
@@ -936,12 +937,14 @@ VOICES = {
     "Female": {"pitch": 1.5, "formant": 1.15, "highpass": 120.0},
     "Male": {"pitch": 0.8, "formant": 0.9, "highpass": 80.0},
     "Robot": {"mod": (50.0, 0.85), "compress": (0.3, 4.0), "drive": 1.2, "echo": (12, 0.7, 0.6)},
-    "Walkie-Talkie": {"highpass": 400.0, "lowpass": 2700.0, "presence": (1500.0, 4.0), "compress": (0.25, 6.0), "drive": 1.2,
-                      "static": 0.015},
-    "Cave": {"lowpass": 5000.0, "echo": (180, 0.45, 0.45), "reverb": 0.45},  # a dark reverb reads as stone
+    # The band thins the voice out, so it needs real gain to sound as loud as the others. The compression starts at
+    # quiet mic levels, so soft syllables stay up where Discord's voice detection hears them.
+    "Walkie-Talkie": {"highpass": 400.0, "lowpass": 2800.0, "presence": (1500.0, 3.0), "compress": (0.1, 3.0), "drive": 2.6,
+                      "static": 0.008},
+    "Cave": {"lowpass": 5000.0, "drive": 1.3, "echo": (180, 0.45, 0.45), "reverb": 0.45},  # a dark reverb reads as stone
     "Demon": {"pitch": 0.67, "formant": 0.62, "lowpass": 6000.0, "compress": (0.3, 4.0), "drive": 1.6, "reverb": 0.5},
     "Alien": {"pitch": 1.2, "formant": 0.7, "mod": (300.0, 0.35), "drive": 2.4, "reverb": 0.3},
-    "Ghost": {"pitch": 1.06, "formant": 1.15, "highpass": 250.0, "mod": (5.0, 0.3), "drive": 1.5, "echo": (260, 0.4, 0.4), "reverb": 0.55},
+    "Ghost": {"pitch": 1.06, "formant": 1.15, "highpass": 250.0, "mod": (5.0, 0.3), "drive": 1.95, "echo": (260, 0.4, 0.4), "reverb": 0.55},
     # A slight drop and rasp through a phone band: the film voice isn't demon-deep.
     "Ghostface": {"pitch": 0.87, "formant": 0.85, "highpass": 300.0, "lowpass": 3400.0, "compress": (0.3, 4.0), "drive": 1.2},
     # Resonance below pitch gives a huge chest; compression and drive growl on loud words.
@@ -960,9 +963,10 @@ if WINDOWS:
     SOUND_SINK = "audioconvert ! audioresample ! wasapi2sink name=out low-latency=true"
 else:
     WEBCAM_SOURCE, WEBCAM_DEVICE = "v4l2src name=cam ! image/jpeg,width=1280,height=720,framerate=30/1 ! jpegdec", "device"
-    MIC_SOURCE = "pulsesrc name=mic buffer-time=40000 latency-time=10000"
-    VOICE_SINK = "pulsesink name=voice_out buffer-time=40000 latency-time=10000 sync=false"
-    SOUND_SINK = "audioconvert ! audioresample ! pulsesink name=out"
+    # Each stream has its own name: PipeWire remembers volumes per name, and all of them were once "python3".
+    MIC_SOURCE = 'pulsesrc name=mic buffer-time=40000 latency-time=10000 client-name="Redbarn Studio mic"'
+    VOICE_SINK = 'pulsesink name=voice_out buffer-time=40000 latency-time=10000 sync=false client-name="Redbarn Studio voice"'
+    SOUND_SINK = 'audioconvert ! audioresample ! pulsesink name=out client-name="Redbarn Studio sounds"'
 # Separate process: a playback fault must never reach what Discord receives.
 MONITOR_CMD = ["pw-loopback", "--name=redbarn-monitor", f"--capture={MIC_NODE}"]
 MIC_PROPS = "node.dont-fallback=true priority.session=1 priority.driver=1 audio.position=[FL FR]"
@@ -976,7 +980,7 @@ class PitchShifter:
 
     def __init__(self):
         self.wanted = self.applied = (1.0, 1.0)
-        self.mod, self.static, self.phase = (0.0, 0.0), 0.0, 0.0
+        self.mod, self.static, self.phase, self.envelope = (0.0, 0.0), 0.0, 0.0, 0.0
         lib = self.lib = load_rubberband()
         if lib is None:
             return  # pitch voices pass audio through unchanged, and the app says why
@@ -1010,12 +1014,16 @@ class PitchShifter:
     def colour(self, data):
         """Ring modulation or tremolo, and static: GStreamer has no element for these, and they're cheap per sample."""
         samples = array.array("f", data)
-        (hz, depth), static, phase = self.mod, self.static, self.phase
+        (hz, depth), static, phase, envelope = self.mod, self.static, self.phase, self.envelope
         step = 2 * math.pi * hz / 48000
+        release = math.exp(-1 / (0.06 * 48000))  # from speaking level, static is gone about 0.2s after the last word
         for i, x in enumerate(samples):
-            samples[i] = x * (1 - depth + depth * math.sin(phase)) + static * (2 * random.random() - 1)
+            envelope = max(abs(x), envelope * release)
+            # Opens between 0.02 and 0.05: above room noise, below quiet speech.
+            squelch = min(max((envelope - 0.02) / 0.03, 0.0), 1.0)
+            samples[i] = x * (1 - depth + depth * math.sin(phase)) + static * squelch * (2 * random.random() - 1)
             phase += step
-        self.phase = phase % (2 * math.pi)
+        self.phase, self.envelope = phase % (2 * math.pi), envelope
         return samples.tobytes()
 
     def shift(self, data):
@@ -1244,11 +1252,12 @@ def play_sound(path, sink, volume, device=None):
     # Audio only: an MP3's cover art would otherwise open a video window. soft-volume keeps the volume working on any sink.
     Gst.util_set_object_arg(player, "flags", "audio+soft-volume")
     player.set_property("uri", Gst.filename_to_uri(path))
-    output = Gst.parse_bin_from_description(sink, True)
+    # Volume inside the pipeline, never playbin's: that sets the stream's own volume, which PipeWire saves and
+    # restores onto the app's other streams, including the voice, and which Windows applies to the whole app.
+    output = Gst.parse_bin_from_description(f"audioconvert ! audioamplify amplification={volume:.6f} ! {sink}", True)
     if device:
         output.get_by_name("out").set_property("device", device)
     player.set_property("audio-sink", output)
-    player.set_property("volume", volume)
     player.set_state(Gst.State.PLAYING)
     return player
 
@@ -2106,13 +2115,19 @@ def check_voices():
     print(f"Walkie-Talkie compression: 4x louder input comes out {loud / quiet:.1f}x louder")
     assert loud / quiet < 3.0, "Walkie-Talkie isn't compressed"
 
-    floors = {}
+    # Quiet speech: louder than Normal, and the static rides under it. Silence: no static at all.
+    tone.set_property("volume", 0.1)
+    normal, radio = voice_at("Normal", 1000), voice_at("Walkie-Talkie", 1000)
     tone.set_property("volume", 0.0)
-    for name in ("Normal", "Walkie-Talkie"):
-        floors[name] = peak(voice_at(name, 1000))
+    time.sleep(0.5)  # longer than the squelch's fade
+    silent = peak(listen(sink))
     tone.set_property("volume", 0.4)
-    print(f"Silence: Walkie-Talkie static {floors['Walkie-Talkie']:.4f}, Normal {floors['Normal']:.4f}")
-    assert floors["Walkie-Talkie"] > 0.005 > floors["Normal"], "Walkie-Talkie has no static, or Normal does"
+    static = power_at(radio, 1700) / max(power_at(normal, 1700), 1e-9)  # 1700Hz: no harmonic of the 1000Hz tone
+    print(f"Walkie-Talkie, quiet speech: {peak(radio):.3f} vs Normal {peak(normal):.3f}, static {static:.0f}x Normal's; "
+          f"in silence {silent:.4f}")
+    assert peak(radio) > 2 * peak(normal), "Walkie-Talkie is quieter than it should be on quiet speech"
+    assert static > 10, "Walkie-Talkie has no static while talking"
+    assert silent < 0.002, "Walkie-Talkie hisses during silence"
 
     tails = {}
     for name in ("Normal", "Cave", "Ghost"):

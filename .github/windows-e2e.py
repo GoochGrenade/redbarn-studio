@@ -69,10 +69,15 @@ if camera:
         Gst.PadProbeType.BUFFER, lambda *_: (sent.__setitem__(0, sent[0] + 1), Gst.PadProbeReturn.OK)[1])
     app.set_look(camera.get_by_name("fx"), "Night Vision")
     camera.set_state(Gst.State.PLAYING)
+    # The first frame waits for the shader to compile, which takes seconds on the server's software OpenGL.
+    deadline = time.monotonic() + 30
+    while sent[0] == 0 and time.monotonic() < deadline:
+        time.sleep(0.2)
+    first = sent[0]
     time.sleep(4)
     message = camera.get_bus().pop_filtered(Gst.MessageType.ERROR)
     check(message is None, "camera pipeline runs" + (f": {message.parse_error()[0].message}" if message else ""))
-    check(sent[0] > 30, f"frames sent to OBS Virtual Camera in 4s: {sent[0]}")
+    check(sent[0] - first > 30, f"frames sent to OBS Virtual Camera in 4s after the first: {sent[0] - first}")
     # Read one frame back the way a DirectShow app like Discord would see the camera.
     grab = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "dshow", "-i", "video=OBS Virtual Camera",
                            "-frames:v", "1", "-s", "160x90", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
