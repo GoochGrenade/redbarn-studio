@@ -20,6 +20,7 @@ import json
 import math
 import operator
 import os
+import pathlib
 import random
 import re
 import shutil
@@ -2843,7 +2844,7 @@ def check_updates_and_startup():
         for path, text in ((new, "print('new')\n"), (current, "print('current')\n")):
             with open(path, "w") as f:
                 f.write(text)
-        url, size, digest = "file://" + new, os.path.getsize(new), hashlib.sha256(open(new, "rb").read()).hexdigest()
+        url, size, digest = pathlib.Path(new).as_uri(), os.path.getsize(new), hashlib.sha256(open(new, "rb").read()).hexdigest()
         for wrong_size, wrong_digest in ((size + 1, digest), (size, "0" * 64)):
             try:
                 download_update(url, current, wrong_size, wrong_digest, lambda _: None)
@@ -2861,7 +2862,7 @@ def check_updates_and_startup():
         assert sorted(os.listdir(folder)) == ["current", "new"], "a failed update left files behind"
         with open(new, "w") as f:
             f.write("print('new')\n")
-        download_update(url, current, os.path.getsize(new), hashlib.sha256(b"print('new')\n").hexdigest(), lambda _: None, check_program)
+        download_update(url, current, os.path.getsize(new), hashlib.sha256(open(new, "rb").read()).hexdigest(), lambda _: None, check_program)
         assert open(current).read() == "print('new')\n", "a good update wasn't installed"
         # A temporary home on Linux; on Windows a separate registry entry, so the real setting is never touched.
         value = APP_NAME + " self-test"
