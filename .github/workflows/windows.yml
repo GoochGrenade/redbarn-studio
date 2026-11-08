@@ -190,7 +190,7 @@ jobs:
           $version = (Select-String -Path redbarn-studio -Pattern '^VERSION = "(.+)"').Matches[0].Groups[1].Value
           $installed = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{E47D0CD0-B482-458D-904E-8E06AE09CE4A}_is1").DisplayVersion
           if ($installed -ne $version) { throw "installed version is $installed, expected $version" }
-          Write-Output "updated 1.3.1 to $installed: settings kept, app reopened"
+          Write-Output "updated 1.3.1 to ${installed}: settings kept, app reopened"
       - name: Uninstall, as a user would
         shell: pwsh
         run: |
