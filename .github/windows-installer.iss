@@ -46,6 +46,12 @@ Name: "{autodesktop}\Redbarn Studio"; Filename: "{app}\Redbarn Studio.exe"; Task
 Filename: "{sys}\regsvr32.exe"; Parameters: "/s ""{app}\virtualcam\obs-virtualcam-module64.dll"""; Flags: runhidden; Check: NeedCamera
 Filename: "{syswow64}\regsvr32.exe"; Parameters: "/s ""{app}\virtualcam\obs-virtualcam-module32.dll"""; Flags: runhidden; Check: NeedCamera
 Filename: "{app}\Redbarn Studio.exe"; Description: "Open Redbarn Studio"; Flags: nowait postinstall skipifsilent
+; An update from inside the app runs silently with /RELAUNCH=1: reopen the app as the user, not as admin.
+Filename: "{app}\Redbarn Studio.exe"; Flags: nowait runasoriginaluser; Check: Relaunch
+
+[Registry]
+; Start at Login is set by the app itself; only removed here, on uninstall.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Redbarn Studio"; Flags: uninsdeletevalue dontcreatekey
 
 [Code]
 var
@@ -64,6 +70,11 @@ var
 begin
   Path := CameraPath();
   Result := (Path = '') or not FileExists(Path) or (Pos(Lowercase(ExpandConstant('{app}')), Lowercase(Path)) = 1);
+end;
+
+function Relaunch(): Boolean;
+begin
+  Result := ExpandConstant('{param:relaunch|0}') = '1';
 end;
 
 function CableInstalled(): Boolean;

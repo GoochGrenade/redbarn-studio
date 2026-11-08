@@ -2,13 +2,13 @@
 
 Cinematic camera looks, voice filters and a soundboard for Discord and other apps. Pick a look and a voice, and your apps see a filtered camera and mic like any other device.
 
-**15 looks:** Clean, Night Vision, Grainy Film, Hi-Def, 2008 Webcam, VHS, Noir, CCTV, Camcorder, Thermal, Silent Film, Blockbuster, Red Barn, Warband and Old Quest. CCTV, Night Vision and Camcorder add a blinking record dot and a date stamp.
+**16 looks:** Clean, Night Vision, Grainy Film, Hi-Def, 2008 Webcam, VHS, Noir, CCTV, Camcorder, Thermal, Silent Film, Blockbuster, Red Barn, Warband, Old Quest and Underwater. CCTV, Night Vision and Camcorder add a blinking record dot and a date stamp.
 
-**15 voices:** Normal, Deep, Chipmunk, Child, Female, Male, Robot, Walkie-Talkie, Cave, Demon, Alien, Ghost, Ghostface, Orc Warlord and Adventurer.
+**16 voices:** Normal, Deep, Chipmunk, Child, Female, Male, Robot, Walkie-Talkie, Cave, Demon, Alien, Ghost, Ghostface, Orc Warlord, Adventurer and Auto-Tune, which pitch-corrects your voice to the key and scale you pick, from an instant robotic snap to a smooth glide.
 
 **Soundboard:** six original sounds (Air Horn, Ba-Dum-Tss, Sad Trombone, Buzzer, Ding and Crickets), plus any MP3, WAV or OGG clips you add with the **+** button or by dragging them onto the soundboard. Search finds a sound quickly, and right-clicking one of your own clips removes it. Sounds broadcast through the mic, so everyone on the call hears them. Every clip is matched to about the loudness of a voice, so quiet and loud clips come out alike. **Output Volume** sets how loud they are for others, and **Monitor Volume** sets how loud they are for you. Redbarn Studio doesn't include game or meme sounds, because they belong to their owners. You can download clips yourself, for example from [myinstants.com](https://www.myinstants.com), and add them.
 
-The **Microphone** menu follows your computer's default mic, so plugging in a headset switches to it, or you can pick a mic. You can also hear your own filtered voice with **Voice Playback**, mirror the overlay text, flip the camera and switch between dark and light mode. Redbarn Studio remembers your settings, and **Setup & Help** in the menu (or F1) checks your computer and shows how to fix anything that's missing.
+The **Microphone** menu follows your computer's default mic, so plugging in a headset switches to it, or you can pick a mic. A picked mic is remembered, and if it's unplugged, Redbarn Studio uses the default until it's back. You can also hear your own filtered voice with **Voice Playback**, mirror the overlay text, flip the camera and switch between dark and light mode. Redbarn Studio remembers your settings, can open when you sign in (**Start at Login**), and checks once a day for a new version, which it installs only when you say so (or use **Check for Updates** in the menu). **Setup & Help** in the menu (or F1) checks your computer and shows how to fix anything that's missing.
 
 ## Linux
 

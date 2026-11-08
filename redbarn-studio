@@ -12,11 +12,16 @@ import array
 import ctypes
 import ctypes.util
 import functools
+import gc
 import glob
+import hashlib
+import itertools
 import json
 import math
+import operator
 import os
 import random
+import re
 import shutil
 import signal
 import struct
@@ -25,7 +30,9 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import wave
+import weakref
 from datetime import datetime
 
 WINDOWS = sys.platform == "win32"
@@ -36,7 +43,7 @@ elif WINDOWS and sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the console's default code page can't print ✓
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 REPO_URL = "https://github.com/GoochGrenade/redbarn-studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
 MIC_NAME = "CABLE Output" if WINDOWS else "Redbarn Mic"  # what to pick in Discord
@@ -302,6 +309,114 @@ def refresh_menus(home=None):
             subprocess.run(command, capture_output=True)
 
 
+def launcher_text(program):
+    return f"""[Desktop Entry]
+Type=Application
+Name={APP_NAME}
+Comment=Cinematic camera looks, voice filters and a soundboard for Discord and other apps
+Exec={desktop_quote(program)}
+Icon={APP_ID}
+Categories=AudioVideo;Video;
+StartupWMClass={APP_ID}
+Terminal=false
+"""
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def autostart_path(home=None):
+    return os.path.join(home or os.path.expanduser("~"), ".config", "autostart", f"{APP_ID}.desktop")
+
+
+def autostart_enabled(home=None, value=APP_NAME):
+    """Whether Start at Login is on. The system's own setting is the record, so it survives reinstalls."""
+    if WINDOWS:
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+                winreg.QueryValueEx(key, value)
+            return True
+        except OSError:
+            return False
+    return os.path.exists(autostart_path(home))
+
+
+def set_autostart(enabled, home=None, value=APP_NAME):
+    if WINDOWS:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, value, 0, winreg.REG_SZ, f'"{sys.executable}"')
+            else:
+                try:
+                    winreg.DeleteValue(key, value)
+                except FileNotFoundError:
+                    pass
+        return
+    path = autostart_path(home)
+    if enabled:
+        installed = install_paths(home)[0]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(launcher_text(installed if os.path.exists(installed) else os.path.realpath(__file__)))
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+RELEASES_API = "https://api.github.com/repos/GoochGrenade/redbarn-studio/releases/latest"
+UPDATE_ASSET = "Redbarn-Studio-Setup.exe" if WINDOWS else "redbarn-studio"
+
+
+def version_tuple(text):
+    return tuple(int(n) for n in re.findall(r"\d+", text)[:3])
+
+
+def parse_release(release):
+    """From GitHub's latest-release JSON: (version, download URL, size, sha256 or None) for this computer's download."""
+    asset = next((a for a in release.get("assets", []) if a.get("name") == UPDATE_ASSET), None)
+    if not asset:
+        raise RuntimeError(f"the latest release has no {UPDATE_ASSET}")
+    digest = asset.get("digest") or ""
+    return release["tag_name"].lstrip("v"), asset["browser_download_url"], asset["size"], digest[7:] if digest.startswith("sha256:") else None
+
+
+def web_request(url):
+    return urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}", "Accept": "application/vnd.github+json"})
+
+
+def latest_release():
+    with urllib.request.urlopen(web_request(RELEASES_API), timeout=15) as response:
+        return parse_release(json.load(response))
+
+
+def download_update(url, path, size, digest, progress, check=None):
+    """Download beside path, verify it, then swap it in: a failed or interrupted download changes nothing."""
+    part, sha, got = path + ".part", hashlib.sha256(), 0
+    try:
+        with urllib.request.urlopen(web_request(url), timeout=30) as response, open(part, "wb") as out:
+            while chunk := response.read(1 << 16):
+                out.write(chunk)
+                sha.update(chunk)
+                got += len(chunk)
+                progress(got / size)
+        if got != size or (digest and sha.hexdigest() != digest):
+            raise RuntimeError("the download was incomplete or damaged")
+        if check:
+            check(part)
+        os.replace(part, path)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+
+
+def check_program(path):
+    """A downloaded Linux build must at least be a complete Python program before it replaces this one."""
+    with open(path, encoding="utf-8") as f:
+        compile(f.read(), path, "exec")
+    os.chmod(path, 0o755)
+
+
 def install(home=None):
     program, icon, launcher = install_paths(home)
     for path in (program, icon, launcher):
@@ -312,16 +427,7 @@ def install(home=None):
     with open(icon, "w") as f:
         f.write(ICON_SVG)
     with open(launcher, "w") as f:
-        f.write(f"""[Desktop Entry]
-Type=Application
-Name={APP_NAME}
-Comment=Cinematic camera looks, voice filters and a soundboard for Discord and other apps
-Exec={desktop_quote(program)}
-Icon={APP_ID}
-Categories=AudioVideo;Video;
-StartupWMClass={APP_ID}
-Terminal=false
-""")
+        f.write(launcher_text(program))
     refresh_menus(home)
     print(f"Installed {APP_NAME}. Open it from your app menu.")
     report()
@@ -330,7 +436,7 @@ Terminal=false
 
 
 def uninstall(home=None):
-    for path in install_paths(home):
+    for path in (*install_paths(home), autostart_path(home)):
         if os.path.exists(path):
             os.remove(path)
     refresh_menus(home)
@@ -338,7 +444,7 @@ def uninstall(home=None):
 
 
 if __name__ == "__main__" and WINDOWS and sys.argv[1:2] in (["--install"], ["--uninstall"]):
-    sys.exit(f"On Windows, open {APP_NAME} from the folder you unzipped; there's nothing to install.")
+    sys.exit(f"On Windows, {APP_NAME} is installed and removed with its installer, from Windows Settings > Apps.")
 if __name__ == "__main__" and sys.argv[1:2] in (["--install"], ["--uninstall"], ["--check"]):
     {"--install": install, "--uninstall": uninstall, "--check": report}[sys.argv[1]]()
     sys.exit(0)
@@ -381,7 +487,7 @@ CSS = """
 """
 
 LOOKS = ["Clean", "Night Vision", "Grainy Film", "Hi-Def", "2008 Webcam", "VHS", "Noir", "CCTV",
-         "Camcorder", "Thermal", "Silent Film", "Blockbuster", "Red Barn", "Warband", "Old Quest"]
+         "Camcorder", "Thermal", "Silent Film", "Blockbuster", "Red Barn", "Warband", "Old Quest", "Underwater"]
 GRAINY_LOOKS = ["Night Vision", "Grainy Film", "VHS", "Noir", "CCTV", "Camcorder", "Silent Film"]
 PREVIEW_WIDTH, PREVIEW_HEIGHT = 640, 360
 
@@ -440,13 +546,13 @@ vec3 night_vision(vec2 uv) {
   vec2 o = PX * 2.0;
   float l = (luma(get(uv)) * 2.0 + luma(get(uv + o)) + luma(get(uv - o))) * 0.25;  // soft, low-resolution sensor
   float g = pow(l, 0.6) * 1.5 + luma(bloom(uv, 10.0, 0.75)) * 0.8 + grain(uv, 0.22);  // infrared highlights flare
-  return vec3(0.08, 1.0, 0.14) * g * vignette(uv, 1.4);
+  return vec3(0.08, 1.0, 0.14) * g * vignette(uv, 1.0);
 }
 vec3 grainy_film(vec2 uv) {
   vec3 c = mix(vec3(0.07, 0.06, 0.05), vec3(1.0, 0.95, 0.85), get(uv));
   c += vec3(0.45, 0.08, 0.03) * luma(bloom(uv, 6.0, 0.6)) * 2.0;  // halation: film glows red around highlights
   float flicker = 1.0 + 0.025 * sin(time * 37.0);
-  return (c + grain(uv, 0.16)) * flicker * vignette(uv, 0.8);
+  return (c + grain(uv, 0.16)) * flicker * vignette(uv, 0.55);
 }
 vec3 hi_def(vec2 uv) {
   vec3 c = get(uv);
@@ -484,7 +590,7 @@ vec3 vhs(vec2 uv) {
 }
 vec3 noir(vec2 uv) {
   float g = smoothstep(0.1, 0.85, luma(get(uv))) + grain(uv, 0.1);
-  return vec3(g) * vignette(uv, 1.0);
+  return vec3(g) * vignette(uv, 0.7);
 }
 vec3 cctv(vec2 uv) {
   vec2 d = uv - 0.5;
@@ -494,7 +600,7 @@ vec3 cctv(vec2 uv) {
   vec3 c = get(src) + bloom(src, 6.0, 0.7) * 0.6;
   c = mix(vec3(luma(c)), c, 0.15) * vec3(0.92, 1.0, 0.96);
   c = (c - 0.5) * 1.2 + 0.5 + grain(uv, 0.12);
-  return c * scanlines(uv, 288.0, 0.14) * vignette(uv, 1.3);
+  return c * scanlines(uv, 288.0, 0.14) * vignette(uv, 0.9);
 }
 vec3 camcorder(vec2 uv) {
   vec2 o = PX * 1.2;
@@ -533,7 +639,7 @@ vec3 silent_film(vec2 uv) {
   float scratch = 1.0 - step(abs(uv.x - rand(vec2(1.0, 2.0))), 0.0008) * step(0.6, rand(vec2(3.0, 4.0))) * 0.6;
   float dust = 1.0 - step(0.9995, rand(floor(uv * vec2(320.0, 180.0)))) * 0.8;
   float flicker = 0.92 + 0.12 * barn_noise(vec2(frame, 5.0));
-  return vec3(1.0, 0.86, 0.62) * g * scratch * dust * flicker * vignette(uv, 0.8);
+  return vec3(1.0, 0.86, 0.62) * g * scratch * dust * flicker * vignette(uv, 0.55);
 }
 vec3 blockbuster(vec2 uv) {
   if (abs(uv.y - 0.5) > 0.372) return vec3(0.0);
@@ -748,7 +854,7 @@ vec3 warband(vec2 uv) {
   c *= mix(vec3(0.8, 0.35, 0.25), vec3(1.2, 0.92, 0.7), smoothstep(0.1, 0.75, l));  // red-rock shadows, warm highlights
   float flicker = 0.85 + 0.15 * sin(time * 9.0) * sin(time * 5.3);
   c += vec3(0.55, 0.16, 0.02) * smoothstep(0.55, 1.0, uv.y) * 0.45 * flicker;  // firelight from below
-  c *= mix(0.55, 1.0, vignette(uv, 1.1));
+  c *= mix(0.65, 1.0, vignette(uv, 0.8));
   c *= 1.0 - 0.3 * (warband_solid(px + vec2(-7.0, -9.0)) + warband_solid(px + vec2(-13.0, -16.0)));  // soft cast shadows
   for (float layer = 1.0; layer < 3.0; layer += 1.0) {  // embers rising from the fire
     vec2 p = uv * vec2(14.0, 8.0) * layer + vec2(sin(time * 0.9 + uv.y * 5.0 + layer) * 0.25, time * 1.6 * layer);
@@ -835,6 +941,38 @@ vec3 old_quest(vec2 uv) {
   return c;
 }
 
+// Under water: red light is absorbed first, then green, so the deeper the bluer; light from the surface ripples
+// across everything (caustics) and comes down in shafts; bubbles rise and specks of debris drift.
+float caustics(vec2 p) {
+  for (float k = 1.0; k < 4.0; k += 1.0) {  // warped twice over, so the bright lines meander like real ones
+    p += vec2(sin(p.y * 1.7 + time * 0.8 / k + k), sin(p.x * 1.5 - time * 0.7 / k)) * 0.4;
+  }
+  return pow(1.0 - min(abs(sin(p.x * 2.1)), abs(sin(p.y * 2.3 + p.x * 0.4))), 10.0);
+}
+vec3 underwater(vec2 uv) {
+  vec2 bent = uv + vec2(sin(uv.y * 18.0 + time * 1.6), cos(uv.x * 14.0 + time * 1.3)) * 0.003;  // refraction
+  vec3 c = clamp(get(bent), 0.0, 1.0);
+  float depth = 0.35 + 0.5 * uv.y;
+  c *= vec3(exp(-2.2 * depth), exp(-0.6 * depth), exp(-0.3 * depth)) * vec3(1.3, 1.1, 1.0);
+  c = mix(c, vec3(0.02, 0.2, 0.27), 0.3 * uv.y + 0.08);  // the water itself, thicker further down
+  c += vec3(0.3, 0.55, 0.55) * caustics(uv * vec2(7.0, 4.0)) * (1.0 - uv.y) * 0.35;
+  float rays = smoothstep(0.55, 1.0, sin((uv.x - uv.y * 0.3) * 20.0 + fbm(vec2(uv.x * 3.0, time * 0.15)) * 6.0) * 0.5 + 0.5);
+  c += vec3(0.35, 0.6, 0.6) * rays * 0.1 * (1.0 - uv.y);
+  vec2 aspect = vec2(16.0, 9.0);
+  for (float layer = 1.0; layer < 3.0; layer += 1.0) {
+    vec2 p = uv * aspect * layer * 0.7 + vec2(sin(time * 1.3 + uv.y * 7.0 + layer) * 0.15, time * 0.9 * layer);  // bubbles rise
+    vec2 cell = floor(p);
+    vec2 centre = vec2(barn_noise(cell), barn_noise(cell + 5.0)) * 0.6 + 0.2;
+    float r = 0.06 + 0.06 * barn_noise(cell + 9.0), d = length(fract(p) - centre);
+    float bubble = step(0.82, barn_noise(cell + layer * 4.0));
+    c += vec3(0.7, 0.9, 1.0) * bubble * (smoothstep(r, r * 0.8, d) - smoothstep(r * 0.75, r * 0.45, d)) * 0.5;  // a bright rim
+    c += vec3(1.0) * bubble * smoothstep(r * 0.3, 0.0, length(fract(p) - centre + r * 0.35)) * 0.5;  // and a glint
+    vec2 q = uv * aspect * layer * 2.0 + vec2(time * 0.05, -time * 0.03 * layer);  // drifting specks
+    c += vec3(0.6, 0.75, 0.7) * step(0.93, barn_noise(floor(q) + layer)) * smoothstep(0.08, 0.0, length(fract(q) - 0.5)) * 0.25;
+  }
+  return c * vignette(uv, 0.85);
+}
+
 void main() {
   vec2 uv = v_texcoord;
   vec3 c;
@@ -852,7 +990,8 @@ void main() {
   else if (mode < 11.5) c = blockbuster(uv);
   else if (mode < 12.5) c = red_barn(uv);
   else if (mode < 13.5) c = warband(uv);
-  else c = old_quest(uv);
+  else if (mode < 14.5) c = old_quest(uv);
+  else c = underwater(uv);
   gl_FragColor = vec4(c, 1.0);
 }
 """
@@ -915,7 +1054,9 @@ FILTER_CHAIN = (
 VOICE_CHAIN = (
     "audioconvert ! audioresample ! audio/x-raw,format=F32LE,channels=1,rate=48000 "
     "! appsink name=shifter_in emit-signals=true sync=false "
-    'appsrc name=shifter_out is-live=true format=time do-timestamp=true '
+    # At most 60ms queued, dropping the oldest: after a stall (a game's CPU spike) the backlog would otherwise
+    # play out at real time forever, adding its length to the delay for the rest of the session.
+    'appsrc name=shifter_out is-live=true format=time do-timestamp=true max-bytes=11520 leaky-type=downstream '
     'caps="audio/x-raw,format=F32LE,channels=1,rate=48000,layout=interleaved" '
     "! audiocheblimit name=highpass mode=high-pass poles=4 ! audiocheblimit name=lowpass mode=low-pass poles=4 "
     # Compression and the mid boost before drive: drive adds back the level and grit, and its clip keeps it in range.
@@ -951,6 +1092,8 @@ VOICES = {
     # Resonance below pitch gives a huge chest; compression and drive growl on loud words.
     "Orc Warlord": {"pitch": 0.78, "formant": 0.68, "lowpass": 5000.0, "compress": (0.3, 4.0), "drive": 1.3, "reverb": 0.15},
     "Adventurer": {"pitch": 1.1, "formant": 1.0, "highpass": 100.0, "drive": 1.25, "reverb": 0.2},
+    # Pitch correction to the key and scale picked under it (see AutoTune); no reverb, which reads as echo.
+    "Auto-Tune": {"tune": True, "compress": (0.3, 3.0)},
 }
 RUBBERBAND_MISSING = "This voice needs the Rubber Band library, so it sounds like Normal. Open Setup & Help (F1) to fix it."
 MIC_LOST = f"No sound is reaching {APP_NAME} from your mic. Check it's plugged in."
@@ -973,6 +1116,114 @@ MONITOR_CMD = ["pw-loopback", "--name=redbarn-monitor", f"--capture={MIC_NODE}"]
 MIC_PROPS = "node.dont-fallback=true priority.session=1 priority.driver=1 audio.position=[FL FR]"
 
 
+NOTE_NAMES = ["C", "C♯", "D", "E♭", "E", "F", "F♯", "G", "A♭", "A", "B♭", "B"]
+SCALES = {"Chromatic": tuple(range(12)), "Major": (0, 2, 4, 5, 7, 9, 11), "Minor": (0, 2, 3, 5, 7, 8, 10)}
+# Read live by Auto-Tune: key (0 is C), scale, retune speed (0 snaps instantly, 1 glides) and strength (0 to 1).
+TUNE = {"key": 0, "scale": "Chromatic", "speed": 0.0, "strength": 1.0}
+
+
+def nearest_note(midi, key, scale):
+    """The note of the key and scale nearest to a pitch, in MIDI numbers (69 is A at 440Hz)."""
+    allowed = SCALES[scale]
+    return min((n for n in range(math.floor(midi) - 2, math.floor(midi) + 4) if (n - key) % 12 in allowed),
+               key=lambda n: abs(n - midi))
+
+
+class AutoTune:
+    """Real-time pitch correction by TD-PSOLA, as hardware and plugin auto-tuners do it: two-period slices of
+    the voice are laid down again at the corrected period. The slices keep the voice's own resonances, so it
+    stays your voice, and the only delay is a fixed DELAY. Unvoiced sounds and silence pass through unchanged.
+    """
+    DELAY = 1600  # 33ms: 2.5 periods of the lowest pitch tracked (75Hz), so every slice is whole before it plays
+
+    def __init__(self):
+        self.buf = array.array("f", bytes(4 * self.DELAY))  # recent input; buf[0] is at sample self.start
+        self.start = self.out_start = self.emitted = -self.DELAY  # out holds slices laid down; emitted, the next to play
+        self.out = array.array("f")
+        self.total = self.blocks = 0
+        self.mark = self.anchor = 0.0  # where the next slice goes, and where in the voice it's cut from
+        self.period, self.correction, self.wet = None, 0.0, 0.0
+        self.windows = {}
+
+    def detect(self):
+        """The voice's period in samples, or None if it isn't a voiced sound: found at 8kHz, refined at 48kHz."""
+        recent = self.buf[-1920:]
+        coarse = array.array("f", (sum(recent[i:i + 6]) / 6 for i in range(0, 1920, 6)))
+        window = coarse[:160]
+        power = sum(map(operator.mul, window, window))
+        if power < 160 * 1e-5:
+            return None
+        shifted, differences = sum(map(operator.mul, coarse[12:172], coarse[12:172])), []
+        for lag in range(12, 107):  # 670Hz down to 75Hz; 0 means the sound repeats exactly after that lag
+            if lag > 12:
+                shifted += coarse[lag + 159] ** 2 - coarse[lag - 1] ** 2
+            differences.append(1 - 2 * sum(map(operator.mul, window, coarse[lag:lag + 160])) / (power + shifted))
+        # The first clear dip, not the deepest: deeper dips at double the lag are the octave below.
+        dip = next((i for i in range(1, len(differences) - 1) if differences[i] < 0.3
+                    and differences[i] <= differences[i - 1] and differences[i] <= differences[i + 1]), None)
+        if dip is None:
+            return None
+        window = recent[:960]
+        power = sum(map(operator.mul, window, window))
+        scores = {}
+        for lag in range(6 * (12 + dip) - 6, 6 * (12 + dip) + 7):
+            seg = recent[lag:lag + 960]
+            scores[lag] = 1 - 2 * sum(map(operator.mul, window, seg)) / (power + sum(map(operator.mul, seg, seg)))
+        lag = min(scores, key=scores.get)
+        a, b, c = scores.get(lag - 1), scores[lag], scores.get(lag + 1)
+        return lag + (0.5 * (a - c) / (a - 2 * b + c) if a is not None and c is not None and a - 2 * b + c else 0.0)
+
+    def process(self, data):
+        incoming = array.array("f", data)
+        self.buf.extend(incoming)
+        self.total += len(incoming)
+        self.blocks += 1
+        if self.blocks % 2:  # every 20ms: quick enough to snap, at half the cost
+            self.period = self.detect()
+            if self.period:
+                heard = 69 + 12 * math.log2(48000 / self.period / 440)
+                want = (nearest_note(heard, TUNE["key"], TUNE["scale"]) - heard) * TUNE["strength"]
+                glide = 0.2 * TUNE["speed"] ** 2  # seconds: 0 snaps straight to the note
+                self.correction = want if not glide else self.correction + (want - self.correction) * (1 - math.exp(-0.02 / glide))
+        end = self.total - self.DELAY  # play up to here
+        if self.period:
+            heard_period = self.period
+            new_period = heard_period / 2 ** (self.correction / 12)
+            half = int(round(heard_period))
+            if half not in self.windows:  # sine squared: overlapping slices one period apart sum to exactly 1
+                self.windows[half] = array.array("f", (math.sin(math.pi * i / (2 * half)) ** 2 for i in range(2 * half)))
+            window, gain = self.windows[half], new_period / half
+            if self.mark < self.emitted:  # coming back from silence: start at the playback point
+                self.mark = self.anchor = float(self.emitted)
+            while self.mark < end + half:
+                while self.anchor + heard_period / 2 < self.mark:  # cut from the voice's period nearest the slice
+                    self.anchor += heard_period
+                cut = int(round(self.anchor)) - half - self.start
+                at = int(round(self.mark)) - half - self.out_start
+                if len(self.out) < at + 2 * half:
+                    self.out.extend(bytes(4 * (at + 2 * half - len(self.out))))
+                piece = map(operator.mul, map(operator.mul, self.buf[cut:cut + 2 * half], window), itertools.repeat(gain))
+                self.out[at:at + 2 * half] = array.array("f", map(operator.add, self.out[at:at + 2 * half], piece))
+                self.mark += new_period
+        count = end - self.emitted
+        dry = self.buf[self.emitted - self.start:end - self.start]
+        wet = self.out[self.emitted - self.out_start:end - self.out_start]
+        wet.extend(bytes(4 * (count - len(wet))))
+        target = 1.0 if self.period else 0.0
+        if target == self.wet:
+            result = wet if target else dry
+        else:  # into or out of a voiced sound: crossfade across this block
+            step = (target - self.wet) / count
+            result = array.array("f", (d + (w - d) * (self.wet + step * i) for i, (d, w) in enumerate(zip(dry, wet))))
+        self.wet, self.emitted = target, end
+        del self.out[:max(0, end - self.out_start)]
+        self.out_start = max(self.out_start, end)
+        if len(self.buf) > 6000:  # keep enough to cut slices behind the playback point
+            del self.buf[:len(self.buf) - 6000]
+            self.start = self.total - 6000
+        return result.tobytes()
+
+
 class PitchShifter:
     """Pitch and formant shifting through librubberband, which has no GStreamer element."""
     # Real-time, HighConsistency (allows live changes), FormantPreserved, ThreadingNever, R3 engine.
@@ -982,6 +1233,7 @@ class PitchShifter:
     def __init__(self):
         self.wanted = self.applied = (1.0, 1.0)
         self.mod, self.static, self.phase, self.envelope = (0.0, 0.0), 0.0, 0.0, 0.0
+        self.tune, self.autotune = False, None
         lib = self.lib = load_rubberband()
         if lib is None:
             return  # pitch voices pass audio through unchanged, and the app says why
@@ -1003,13 +1255,16 @@ class PitchShifter:
         self.output_ptr = (ctypes.c_void_p * 1)(ctypes.addressof(self.output))
         self.wanted = self.applied = (1.0, 1.0)
 
-    def want(self, pitch, formant, mod=(0.0, 0.0), static=0.0):
+    def want(self, pitch, formant, mod=(0.0, 0.0), static=0.0, tune=False):
         # Applied by process(): rubberband isn't safe to change from another thread mid-block.
         self.wanted = (pitch, formant)
         self.mod, self.static = mod, static
+        if tune and not self.tune:
+            self.autotune = AutoTune()  # fresh, so it never plays a slice of an earlier voice
+        self.tune = tune
 
     def process(self, data):
-        data = self.shift(data)
+        data = self.autotune.process(data) if self.tune else self.shift(data)
         return self.colour(data) if data and (self.mod[1] or self.static) else data
 
     def colour(self, data):
@@ -1050,11 +1305,20 @@ class PitchShifter:
         return bytes(result)
 
 
+def boost():
+    """Windows: schedule this thread as pro audio (MMCSS), ahead of a game's ordinary threads. No admin needed."""
+    task = ctypes.c_ulong(0)
+    ctypes.windll.avrt.AvSetMmThreadCharacteristicsW("Pro Audio", ctypes.byref(task))
+
+
 def attach_shifter(pipeline):
     shifter = pipeline.shifter = PitchShifter()
     source = pipeline.get_by_name("shifter_out")
 
     def forward(sink, pull):
+        if WINDOWS and not getattr(boost, "done", False):
+            boost.done = True
+            boost()
         buffer = sink.emit(pull).get_buffer()
         data = buffer.extract_dup(0, buffer.get_size())
         output = shifter.process(data)
@@ -1076,7 +1340,8 @@ def set_voice(pipeline, name):
     voice = VOICES[name]
     delay_ms, intensity, feedback = voice.get("echo", (1, 0.0, 0.0))
     pitch = voice.get("pitch", 1.0)
-    pipeline.shifter.want(pitch, voice.get("formant", pitch), voice.get("mod", (0.0, 0.0)), voice.get("static", 0.0))
+    pipeline.shifter.want(pitch, voice.get("formant", pitch), voice.get("mod", (0.0, 0.0)), voice.get("static", 0.0),
+                          voice.get("tune", False))
     threshold, ratio = voice.get("compress", (1.0, 1.0))
     pipeline.get_by_name("compress").set_property("threshold", threshold)
     pipeline.get_by_name("compress").set_property("ratio", 1 / ratio)  # audiodynamic wants the slope: 4:1 is 0.25
@@ -1170,7 +1435,7 @@ ICONS = {
     "dark": "weather-clear-night-symbolic", "add": "list-add-symbolic", "folder": "folder-open-symbolic",
     "stop": "media-playback-stop-symbolic", "menu": "open-menu-symbolic", "camera_off": "camera-disabled-symbolic",
     "ok": "object-select-symbolic", "warning": "dialog-warning-symbolic", "copy": "edit-copy-symbolic",
-    "link": "web-browser-symbolic", "app": APP_ID,
+    "link": "web-browser-symbolic", "startup": "system-run-symbolic", "app": APP_ID,
 }
 SOUNDS_DIR = os.path.join(GLib.get_user_data_dir(), "redbarn-studio", "sounds")
 # Versioned: bump it when a recipe changes, or old copies would keep playing.
@@ -1414,12 +1679,13 @@ class RedbarnStudio(Adw.Application):
         self.problems = {}
         self.camera_group = None
         self.sound_output = None
-        self.sounds = []
+        self.sounds = {}  # playing sound -> its bus handler, disconnected when it stops
         self.sound_files = None
         self.ticking = None
         self.mics = []  # [(device id, name)] as last listed
         self.mic_id = None  # the mic the voice pipeline is reading
-        self.mic_choice = None  # a mic's name, or None for Automatic
+        self.mic_choice = None  # a mic's name, or None for Automatic; kept while unplugged, so it's used again when it's back
+        self.update_checked, self.restart = 0.0, False
         self.mic_poll = 0
         self.polling = False
         self.updating_mics = False
@@ -1440,6 +1706,7 @@ class RedbarnStudio(Adw.Application):
         window.add_css_class("dark-ui")
         window.set_size_request(780, 600)
         for name, handler, accels in (("help", self.show_help, ["F1"]), ("report", self.report_problem, []),
+                                      ("update", lambda: self.check_updates(manual=True), []),
                                       ("about", self.show_about, []), ("quit", self.quit_app, ["<Control>q"])):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", lambda *_, handler=handler: handler())
@@ -1447,7 +1714,7 @@ class RedbarnStudio(Adw.Application):
             self.set_accels_for_action(f"app.{name}", accels)
         menu = Gio.Menu()
         for label, action in (("Setup & Help", "app.help"), ("Report a Problem", "app.report"),
-                              (f"About {APP_NAME}", "app.about"), ("Quit", "app.quit")):
+                              ("Check for Updates", "app.update"), (f"About {APP_NAME}", "app.about"), ("Quit", "app.quit")):
             menu.append(label, action)
 
         brand = Gtk.Box(spacing=8)
@@ -1489,10 +1756,31 @@ class RedbarnStudio(Adw.Application):
         self.mic_menu.connect("notify::selected", self.on_mic_choice)
         self.voice_menu = Adw.ComboRow(title="Voice", model=Gtk.StringList.new(list(VOICES)))
         self.voice_menu.connect("notify::selected", self.on_voice)
+        self.tune_key = Adw.ComboRow(title="Key", model=Gtk.StringList.new(NOTE_NAMES))
+        self.tune_key.connect("notify::selected", lambda row, _: TUNE.update(key=row.get_selected()))
+        self.tune_scale = Adw.ComboRow(title="Scale", model=Gtk.StringList.new(list(SCALES)))
+        self.tune_scale.connect("notify::selected", lambda row, _: TUNE.update(scale=list(SCALES)[row.get_selected()]))
+        tune_rows, tune_sliders = [self.tune_key, self.tune_scale], []
+        for title, subtitle, key in (("Retune Speed", "Left snaps to each note; right glides", "speed"), ("Strength", "How far toward the note", "strength")):
+            scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
+            scale.set_value(TUNE[key])
+            scale.set_size_request(130, -1)
+            scale.update_property([Gtk.AccessibleProperty.LABEL], [f"Auto-Tune {title.lower()}"])
+            scale.connect("value-changed", lambda scale, key=key: TUNE.update({key: scale.get_value()}))
+            row = Adw.ActionRow(title=title, subtitle=subtitle)
+            row.add_suffix(scale)
+            tune_rows.append(row)
+            tune_sliders.append(scale)
+        for row in tune_rows:
+            row.add_prefix(Gtk.Box(width_request=16))  # an icon's width, so the titles line up under Voice
+        self.tune_rows = tune_rows
+        self.tune_speed, self.tune_strength = tune_sliders
         self.monitor = Adw.SwitchRow(title="Voice Playback", subtitle="Use headphones to avoid feedback")
         self.monitor.connect("notify::active", self.on_monitor)
         self.dark = Adw.SwitchRow(title="Dark Mode", active=True)
         self.dark.connect("notify::active", self.on_dark)
+        self.startup = Adw.SwitchRow(title="Start at Login", subtitle=f"Open {APP_NAME} when you sign in", active=autostart_enabled())
+        self.startup.connect("notify::active", self.on_startup)
 
         self.sound_search = Gtk.SearchEntry(placeholder_text="Search sounds", margin_bottom=8)
         self.sound_search.connect("search-changed", lambda _: self.sound_buttons.invalidate_filter())
@@ -1536,13 +1824,13 @@ class RedbarnStudio(Adw.Application):
         window.connect("notify::is-active", lambda w, _: w.is_active() and self.load_sounds())  # picks up folder edits
 
         for row, icon in ((self.look_menu, "look"), (self.mirror, "mirror"), (self.flip_camera, "flip"), (self.mic_menu, "mic"), (self.voice_menu, "voice"),
-                          (self.monitor, "monitor"), (self.dark, "dark")):
+                          (self.monitor, "monitor"), (self.dark, "dark"), (self.startup, "startup")):
             row.add_prefix(Gtk.Image(icon_name=ICONS[icon]))
         settings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_start=8, margin_end=16, margin_top=8, margin_bottom=8)
         for title, description, rows in (
             ("Camera", "Select the virtual camera as your camera source.", (self.look_menu, self.mirror, self.flip_camera)),
-            ("Voice", f"Select '{MIC_NAME}' in your voice chat settings.", (self.mic_menu, self.voice_menu, self.monitor)),
-            ("Appearance", None, (self.dark,)),
+            ("Voice", f"Select '{MIC_NAME}' in your voice chat settings.", (self.mic_menu, self.voice_menu, *self.tune_rows, self.monitor)),
+            ("General", None, (self.dark, self.startup)),
         ):
             group = Adw.PreferencesGroup(title=title, description=description)
             for row in rows:
@@ -1564,6 +1852,8 @@ class RedbarnStudio(Adw.Application):
         self.toasts = Adw.ToastOverlay(child=view)
         window.set_content(self.toasts)
         window.connect("close-request", self.on_close)
+        for row in self.tune_rows:
+            row.set_visible(False)  # until Auto-Tune is picked
         window.present()
         self.start()
         self.start_voice()
@@ -1574,13 +1864,26 @@ class RedbarnStudio(Adw.Application):
         self.apply_settings(load_settings())
         if first_run:
             GLib.idle_add(lambda: self.show_help() and False)
+        if time.time() - self.update_checked > 24 * 3600:
+            self.check_updates(manual=False)
 
     def apply_settings(self, saved):
         # Checked one by one: the file is hand-editable, so any value may be missing or the wrong type.
         if isinstance(saved.get("look"), str) and saved["look"] in LOOKS:
             self.look_menu.set_selected(LOOKS.index(saved["look"]))
-        if isinstance(saved.get("mic"), str) and saved["mic"] in [name for _, name in self.mics]:
-            self.mic_menu.set_selected([name for _, name in self.mics].index(saved["mic"]) + 1)
+        if isinstance(saved.get("mic"), str) and self.sound_output:
+            self.mic_choice = saved["mic"]  # even if it's unplugged now: it's switched to when it's back
+            self.show_mics()
+            self.restart_voice(self.wanted_mic(self.mics, find_mic()))
+        if saved.get("tune_key") in NOTE_NAMES:
+            self.tune_key.set_selected(NOTE_NAMES.index(saved["tune_key"]))
+        if saved.get("tune_scale") in SCALES:
+            self.tune_scale.set_selected(list(SCALES).index(saved["tune_scale"]))
+        for key, scale in (("tune_speed", self.tune_speed), ("tune_strength", self.tune_strength)):
+            if isinstance(saved.get(key), (int, float)):
+                scale.set_value(saved[key])
+        if isinstance(saved.get("update_checked"), (int, float)):
+            self.update_checked = saved["update_checked"]
         if isinstance(saved.get("voice"), str) and saved["voice"] in VOICES:
             self.voice_menu.set_selected(list(VOICES).index(saved["voice"]))
         for key, row in (("mirror", self.mirror), ("flip", self.flip_camera), ("dark", self.dark)):
@@ -1595,7 +1898,90 @@ class RedbarnStudio(Adw.Application):
     def current_settings(self):
         return {"look": self.look, "mic": self.mic_choice, "voice": list(VOICES)[self.voice_menu.get_selected()], "mirror": self.mirror.get_active(),
                 "flip": self.flip_camera.get_active(), "dark": self.dark.get_active(), "send_level": round(self.volume.get_value(), 2),
-                "hear_level": round(self.my_volume.get_value(), 2)}
+                "hear_level": round(self.my_volume.get_value(), 2), "update_checked": self.update_checked,
+                "tune_key": NOTE_NAMES[TUNE["key"]], "tune_scale": TUNE["scale"], "tune_speed": round(TUNE["speed"], 2),
+                "tune_strength": round(TUNE["strength"], 2)}
+
+    def on_startup(self, row, _param):
+        try:
+            set_autostart(row.get_active())
+        except OSError as e:
+            self.toasts.add_toast(Adw.Toast(title=f"Couldn't change Start at Login: {e}"))
+
+    def check_updates(self, manual):
+        def check():
+            try:
+                result = latest_release()
+            except (OSError, ValueError, KeyError, RuntimeError) as e:
+                result = e
+            GLib.idle_add(self.on_update_checked, result, manual)
+        threading.Thread(target=check, daemon=True).start()
+
+    def on_update_checked(self, result, manual):
+        if isinstance(result, Exception):
+            if manual:
+                self.toasts.add_toast(Adw.Toast(title=f"Couldn't check for updates: {result}"))
+            return False
+        self.update_checked = time.time()
+        latest = result[0]
+        if version_tuple(latest) <= version_tuple(VERSION):
+            if manual:
+                self.toasts.add_toast(Adw.Toast(title=f"You have the latest version, {VERSION}."))
+            return False
+        if manual:
+            self.offer_update(result)
+        else:  # found by the daily check: a toast, not a dialog, so it never interrupts
+            toast = Adw.Toast(title=f"{APP_NAME} {latest} is available", button_label="Update", timeout=0)
+            toast.connect("button-clicked", lambda _: self.offer_update(result))
+            self.toasts.add_toast(toast)
+        return False
+
+    def offer_update(self, release):
+        latest = release[0]
+        how = ("The installer opens and asks for permission, then reopens " if WINDOWS else "It replaces this copy; restart to use ") + APP_NAME + "."
+        dialog = Adw.AlertDialog(heading="Update Available",
+                                 body=f"Version {latest} is available. You have {VERSION}.\n{how} Your settings and sounds are kept.")
+        dialog.add_response("later", "Later")
+        dialog.add_response("install", "Update")
+        dialog.set_response_appearance("install", Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect("response", lambda _d, response: response == "install" and self.install_update(release))
+        dialog.present(self.get_active_window())
+
+    def install_update(self, release):
+        latest, url, size, digest = release
+        progress = Adw.Toast(title="Downloading update…", timeout=0)
+        self.toasts.add_toast(progress)
+        target = os.path.join(tempfile.gettempdir(), UPDATE_ASSET) if WINDOWS else os.path.realpath(__file__)
+
+        def work():
+            try:
+                download_update(url, target, size, digest,
+                                lambda done: GLib.idle_add(progress.set_title, f"Downloading update… {done:.0%}"),
+                                None if WINDOWS else check_program)
+                GLib.idle_add(self.on_update_downloaded, progress, latest, target, None)
+            except (OSError, RuntimeError, SyntaxError, ValueError) as e:
+                GLib.idle_add(self.on_update_downloaded, progress, latest, target, e)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_downloaded(self, progress, latest, target, error):
+        progress.dismiss()
+        if error:
+            toast = Adw.Toast(title=f"Update failed: {error}. Nothing was changed.", button_label="Try Again", timeout=0)
+            toast.connect("button-clicked", lambda _: self.check_updates(manual=True))
+            self.toasts.add_toast(toast)
+            return False
+        if WINDOWS:
+            try:  # the installer needs admin rights, so it's opened the way Explorer would, with Windows' permission prompt
+                os.startfile(target, "open", "/SILENT /NORESTART /CLOSEAPPLICATIONS /RELAUNCH=1")
+            except OSError as e:
+                self.toasts.add_toast(Adw.Toast(title=f"Update cancelled: {e.strerror or e}"))
+                return False
+            self.quit_app()
+            return False
+        toast = Adw.Toast(title=f"Updated to {latest}. Restart to use it.", button_label="Restart", timeout=0)
+        toast.connect("button-clicked", lambda _: (setattr(self, "restart", True), self.quit_app()))
+        self.toasts.add_toast(toast)
+        return False
 
     def quit_app(self):
         window = self.get_active_window()
@@ -1762,9 +2148,9 @@ class RedbarnStudio(Adw.Application):
             stop(self.voice_pipeline)
             self.voice_pipeline = None
         self.mic_id = mic
-        # Only Automatic needs saying which mic it found; a picked mic is already shown in the menu.
-        automatic = self.mic_choice is None
-        self.mic_menu.set_subtitle(GLib.markup_escape_text(f"Using {self.mic_name(mic)}") if mic and automatic else "")
+        # Only Automatic, or a picked mic that's unplugged, needs saying which mic is in use; otherwise the menu shows it.
+        stand_in = self.mic_choice is None or self.mic_name(mic) != self.mic_choice
+        self.mic_menu.set_subtitle(GLib.markup_escape_text(f"Using {self.mic_name(mic)}") if mic and stand_in else "")
         if not mic:
             self.voice_off("No microphone found, so voice filters are off. Plug one in and it'll be picked up.")
             return
@@ -1792,9 +2178,14 @@ class RedbarnStudio(Adw.Application):
         # Never called from on_mic_choice: a model change there re-fires the selection, in a loop.
         self.updating_mics = True
         names = [name for _, name in self.mics]
-        self.mic_menu.set_model(Gtk.StringList.new(["Automatic", *names]))
-        self.mic_menu.set_selected(names.index(self.mic_choice) + 1 if self.mic_choice in names else 0)
+        unplugged = self.mic_choice is not None and self.mic_choice not in names  # listed last, so it can still be changed
+        self.mic_menu.set_model(Gtk.StringList.new(["Automatic", *names, *([f"{self.mic_choice} (unplugged)"] if unplugged else [])]))
+        self.mic_menu.set_selected(len(names) + 1 if unplugged else names.index(self.mic_choice) + 1 if self.mic_choice else 0)
         self.updating_mics = False
+
+    def wanted_mic(self, mics, default):
+        """The chosen mic if it's plugged in, otherwise the computer's default."""
+        return next((device for device, name in mics if name == self.mic_choice), default)
 
     def on_mic_choice(self, menu, _param):
         index = menu.get_selected()
@@ -1805,6 +2196,7 @@ class RedbarnStudio(Adw.Application):
             return
         self.mic_choice = choice
         self.restart_voice(self.mics[index - 1][0] if index else find_mic())
+        GLib.idle_add(lambda: self.show_mics() and False)  # drops an "(unplugged)" entry; never rebuilt inside this handler
 
     def poll_mics(self):
         # In a thread: listing Windows devices can take long enough to stutter the window.
@@ -1819,10 +2211,11 @@ class RedbarnStudio(Adw.Application):
         if mics != self.mics:
             self.mics = mics
             self.show_mics()
-        if self.mic_choice is None and default != self.mic_id:
-            self.restart_voice(default)
-            if default:
-                self.toasts.add_toast(Adw.Toast(title=f"Now using {self.mic_name(default)}"))
+        wanted = self.wanted_mic(mics, default)
+        if wanted != self.mic_id:
+            self.restart_voice(wanted)
+            if wanted:
+                self.toasts.add_toast(Adw.Toast(title=f"Now using {self.mic_name(wanted)}"))
         return False
 
     def on_mic_audio(self, _pad, _info):
@@ -1878,6 +2271,8 @@ class RedbarnStudio(Adw.Application):
             set_overlay(self.pipeline, self.look, self.blink)
 
     def on_voice(self, menu, _param):
+        for row in self.tune_rows:
+            row.set_visible(list(VOICES)[menu.get_selected()] == "Auto-Tune")
         if self.voice_pipeline:
             set_voice(self.voice_pipeline, list(VOICES)[menu.get_selected()])
             self.check_mic()
@@ -1950,8 +2345,7 @@ class RedbarnStudio(Adw.Application):
                 player = play_sound(path, SOUND_SINK, sound_volume(path, scale.get_value(), default), device)
                 bus = player.get_bus()
                 bus.add_signal_watch()
-                bus.connect("message", self.on_sound_message, player, name, device)
-                self.sounds.append(player)
+                self.sounds[player] = bus.connect("message", self.on_sound_message, player, name, device)
         except (GLib.Error, OSError, RuntimeError) as e:
             self.toasts.add_toast(Adw.Toast(title=f"Couldn't play {name}: {e}"))
 
@@ -1960,17 +2354,20 @@ class RedbarnStudio(Adw.Application):
             return
         if message.type == Gst.MessageType.ERROR and device == self.sound_output:
             self.toasts.add_toast(Adw.Toast(title=f"Couldn't play {name}: {message.parse_error()[0].message}"))
-        bus.remove_signal_watch()
         self.stop_sound(player)
 
     def stop_sound(self, player):
+        if player not in self.sounds:
+            return
+        # The handler holds the player and the player's bus holds the handler: a loop Python can't collect,
+        # which kept every sound ever played in memory until it's disconnected here.
+        bus = player.get_bus()
+        bus.remove_signal_watch()
+        bus.disconnect(self.sounds.pop(player))
         player.set_state(Gst.State.NULL)
-        if player in self.sounds:
-            self.sounds.remove(player)
 
     def on_stop_sounds(self, _button):
         for player in list(self.sounds):
-            player.get_bus().remove_signal_watch()
             self.stop_sound(player)
 
     def on_add_sounds(self, _button):
@@ -2093,6 +2490,12 @@ def tone_frequency(samples):
     return crossings / (len(samples) / 48000)
 
 
+def exact_frequency(samples):
+    """Frequency from the exact times of the first and last upward zero crossings: precise even on short stretches."""
+    times = [i + a / (a - b) for i, (a, b) in enumerate(zip(samples, samples[1:])) if a < 0 <= b]
+    return (len(times) - 1) / (times[-1] - times[0]) * 48000
+
+
 def peak(samples):
     return max(abs(x) for x in samples)
 
@@ -2143,6 +2546,17 @@ def check_voices():
         else:
             assert radio < normal * 0.25, "Walkie-Talkie isn't narrowing the sound"
 
+    for heard, key, scale, note in ((450, 0, "Chromatic", 440.0), (460, 0, "Chromatic", 466.16), (180, 0, "Chromatic", 185.0),
+                                     (460, 0, "Major", 440.0), (280, 0, "Major", 293.66), (280, 2, "Major", 277.18)):
+        TUNE.update(key=key, scale=scale)
+        voice_at("Auto-Tune", heard)
+        out = voice_at("Auto-Tune", heard)
+        rivals = (heard, note * 2 ** (-1 / 12), note * 2 ** (1 / 12))  # the input pitch, and the notes either side
+        print(f"Auto-Tune      {heard}Hz in, {NOTE_NAMES[key]} {scale}: {tone_frequency(out):.0f}Hz out (nearest note {note:.0f}Hz)")
+        assert power_at(out, note) > 3 * max(power_at(out, f) for f in rivals), "Auto-Tune didn't land on the nearest note of the key and scale"
+    TUNE.update(key=0, scale="Chromatic")
+    check_retune_speed()
+
     robot = voice_at("Robot")
     sidebands, carrier = power_at(robot, 390) + power_at(robot, 490), power_at(robot, 440)
     print(f"Robot ring modulation: 390+490Hz {sidebands:.0f} vs 440Hz {carrier:.0f}")
@@ -2191,6 +2605,26 @@ def check_voices():
     message = pipeline.get_bus().pop_filtered(Gst.MessageType.ERROR)
     pipeline.set_state(Gst.State.NULL)
     assert not message, message.parse_error()[0].message if message else ""
+
+
+def check_retune_speed():
+    """Fed straight to AutoTune: an instant retune is on the note 60ms in; a slow one is still on its way.
+    The output also starts exactly DELAY samples after the input: no other delay, so no echo."""
+    def run(speed, seconds=0.3):
+        TUNE.update(speed=speed)
+        tuner, out = AutoTune(), array.array("f")
+        tone = [0.4 * math.sin(2 * math.pi * 450 * i / 48000) for i in range(int(seconds * 48000))]
+        for i in range(0, len(tone), 480):
+            out.frombytes(tuner.process(array.array("f", tone[i:i + 480]).tobytes()))
+        return out
+    instant, slow = exact_frequency(run(0.0)[-4800:]), exact_frequency(run(1.0, 0.2)[-2400:])
+    TUNE.update(speed=0.0)
+    late = run(0.0)
+    first = next(i for i, x in enumerate(late) if abs(x) > 0.01)
+    print(f"Auto-Tune retune: instant {instant:.1f}Hz, slow {slow:.1f}Hz (450Hz in, note 440Hz); "
+          f"output starts {first / 48:.0f}ms after the input")
+    assert abs(instant - 440) < 1 and 442 < slow < 450, "retune speed makes no difference"
+    assert abs(first - AutoTune.DELAY) < 48, "Auto-Tune adds delay beyond its own"
 
 
 def resonance_centre(name):
@@ -2361,6 +2795,18 @@ def check_sounds():
                 print(f"Ba-Dum-Tss crossings: drum {drum:.0f}/s, cymbal {tss:.0f}/s")
                 assert tss > 3 * drum, "Ba-Dum-Tss has no bright cymbal after the drums"
 
+        # A stopped sound must be freed: its bus handler once held every sound ever played in memory.
+        board = type("Board", (), {"sounds": {}})()
+        player = play_sound(builtin_sound("Ding"), "fakesink name=out sync=false", 0.5)
+        bus = player.get_bus()
+        bus.add_signal_watch()
+        board.sounds[player] = bus.connect("message", lambda *_: None, player)
+        freed = weakref.ref(player)
+        RedbarnStudio.stop_sound(board, player)
+        del player, bus
+        gc.collect()
+        assert freed() is None, "a stopped sound stays in memory"
+
         # Loudness matching: a loud clip and a very quiet one come out at speech level, and one sharp spike
         # caps the gain so the clip never goes past SOUND_PEAK.
         played = {}
@@ -2379,6 +2825,51 @@ def check_sounds():
         for name in ("loud", "quiet"):
             assert abs(20 * math.log10(played[name][0] / SOUND_LEVEL)) < 1, f"the {name} clip isn't matched to speech level"
         assert max(p for _, p in played.values()) <= SOUND_PEAK + 0.01, "a clip is played past its peak limit"
+
+
+def check_updates_and_startup():
+    """Release parsing, safe update downloads (from local files) and Start at Login, in temporary places only."""
+    assert version_tuple("v1.10.0") > version_tuple("1.9.9") > version_tuple("1.9"), "versions compare wrongly"
+    asset = {"name": UPDATE_ASSET, "browser_download_url": "https://example.invalid/x", "size": 5}
+    assert parse_release({"tag_name": "v2.0.1", "assets": [dict(asset, digest="sha256:ab")]}) == ("2.0.1", asset["browser_download_url"], 5, "ab")
+    assert parse_release({"tag_name": "v2.0.1", "assets": [asset]})[3] is None
+    try:
+        parse_release({"tag_name": "v2.0.1", "assets": []})
+        raise AssertionError("a release without this computer's download was accepted")
+    except RuntimeError:
+        pass
+    with tempfile.TemporaryDirectory() as folder:
+        new, current = os.path.join(folder, "new"), os.path.join(folder, "current")
+        for path, text in ((new, "print('new')\n"), (current, "print('current')\n")):
+            with open(path, "w") as f:
+                f.write(text)
+        url, size, digest = "file://" + new, os.path.getsize(new), hashlib.sha256(open(new, "rb").read()).hexdigest()
+        for wrong_size, wrong_digest in ((size + 1, digest), (size, "0" * 64)):
+            try:
+                download_update(url, current, wrong_size, wrong_digest, lambda _: None)
+                raise AssertionError("a damaged update was installed")
+            except RuntimeError:
+                pass
+        with open(new, "w") as f:
+            f.write("this is not ( a program")
+        try:
+            download_update(url, current, os.path.getsize(new), None, lambda _: None, check_program)
+            raise AssertionError("an update that isn't a program was installed")
+        except SyntaxError:
+            pass
+        assert open(current).read() == "print('current')\n", "a failed update changed the program"
+        assert sorted(os.listdir(folder)) == ["current", "new"], "a failed update left files behind"
+        with open(new, "w") as f:
+            f.write("print('new')\n")
+        download_update(url, current, os.path.getsize(new), hashlib.sha256(b"print('new')\n").hexdigest(), lambda _: None, check_program)
+        assert open(current).read() == "print('new')\n", "a good update wasn't installed"
+        # A temporary home on Linux; on Windows a separate registry entry, so the real setting is never touched.
+        value = APP_NAME + " self-test"
+        set_autostart(True, folder, value)
+        assert autostart_enabled(folder, value), "Start at Login didn't turn on"
+        set_autostart(False, folder, value)
+        assert not autostart_enabled(folder, value), "Start at Login didn't turn off"
+    print("updates and Start at Login: ok")
 
 
 def check_mic_list():
@@ -2479,6 +2970,8 @@ def self_test():
     assert mean(silent, 0) > mean(silent, 1) > mean(silent, 2), "Silent Film isn't sepia"
     thermal = frames["Thermal"]
     assert sum(abs(r - b) for r, _, b in thermal) / len(thermal) > 20, "Thermal has no heat colours"
+    sea = frames["Underwater"]
+    assert mean(sea, 2) > 1.3 * mean(sea, 0) and mean(sea, 1) > mean(sea, 0), "Underwater isn't blue-green"
     camp = frames["Warband"]
     assert mean(camp, 0) > 1.3 * mean(camp, 2), "Warband isn't war-red"
     blockbuster = frames["Blockbuster"]
@@ -2494,6 +2987,7 @@ def self_test():
     check_sounds()
     check_settings()
     check_mic_list()
+    check_updates_and_startup()
     check_icons()
     missing = [name for name in GST_ELEMENTS if not Gst.ElementFactory.find(name)]
     assert not missing, f"missing GStreamer elements: {missing}"
@@ -2505,4 +2999,20 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         self_test()
     else:
-        sys.exit(RedbarnStudio().run([sys.argv[0]]))
+        if WINDOWS:
+            # One copy at a time (Start at Login plus a click would fight over the camera): bring the open one forward.
+            # use_last_error: ctypes saves the error straight after the call, before Python can overwrite it.
+            instance = ctypes.WinDLL("kernel32", use_last_error=True).CreateMutexW(None, False, f"Local\\{APP_ID}")
+            if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+                window = ctypes.windll.user32.FindWindowW(None, APP_NAME)
+                if window:
+                    ctypes.windll.user32.ShowWindow(window, 9)  # SW_RESTORE
+                    ctypes.windll.user32.SetForegroundWindow(window)
+                sys.exit(0)
+            # Above-normal, so a busy game can't starve the voice processing of CPU.
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x8000)
+        app = RedbarnStudio()
+        code = app.run([sys.argv[0]])
+        if app.restart:  # after a Linux update: the same file, now the new version
+            os.execv(sys.executable, [sys.executable, os.path.realpath(__file__)])
+        sys.exit(code)
