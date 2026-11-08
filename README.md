@@ -14,7 +14,7 @@ The **Microphone** menu follows your computer's default mic, so plugging in a he
 
 Needs PipeWire, a webcam and a microphone.
 
-1. **[Download the `redbarn-studio` file](https://github.com/GoochGrenade/redbarn-studio/releases/latest/download/redbarn-studio)** (130 KB).
+1. **[Download the `redbarn-studio` file](https://github.com/GoochGrenade/redbarn-studio/releases/latest/download/redbarn-studio)** (155 KB).
 2. In a terminal, in the folder you saved it to, run:
    ```
    python3 redbarn-studio --install
@@ -36,7 +36,7 @@ Needs PipeWire, a webcam and a microphone.
 
 ## Windows
 
-**[Download the Redbarn Studio installer for Windows](https://github.com/GoochGrenade/redbarn-studio/releases/latest/download/Redbarn-Studio-Setup.exe)** (114 MB, Windows 10 or 11, 64-bit)
+**[Download the Redbarn Studio installer for Windows](https://github.com/GoochGrenade/redbarn-studio/releases/latest/download/Redbarn-Studio-Setup.exe)** (86 MB, Windows 10 or 11, 64-bit)
 
 1. Run **Redbarn-Studio-Setup.exe**. If Windows warns that it's from an unknown publisher, click **More info**, then **Run anyway**.
 2. Leave **Install the VB-CABLE virtual mic** ticked. The installer downloads VB-CABLE from [vb-audio.com](https://vb-audio.com/Cable/) and opens its setup: click **Install Driver**. VB-CABLE is donationware by VB-Audio.
