@@ -79,15 +79,15 @@ jobs:
           pyinstaller --noconfirm --log-level WARN .github/windows-package.spec
           cp LICENSE README.md "dist/Redbarn Studio/"
           du -sh "dist/Redbarn Studio"
-          echo "Largest files in the package:"; find "dist/Redbarn Studio" -type f -printf "%s %P\n" | sort -rn | head -15
+          echo "Largest files in the package:"; find "dist/Redbarn Studio" -type f -printf "%s %P\n" | sort -rn | sed -n 1,15p  # sed, not head: head ends the pipe early
           # Software OpenGL is only for this GPU-less server: shipped, it would override users' graphics drivers.
-          if find "dist/Redbarn Studio" -iname "opengl32.dll" -o -iname "libgallium_wgl.dll" | grep .; then echo "Mesa OpenGL is in the package"; exit 1; fi
+          if find "dist/Redbarn Studio" -iname "opengl32.dll" -o -iname "libgallium_wgl.dll" -o -iname "libLLVM*.dll" | grep .; then echo "Mesa OpenGL is in the package"; exit 1; fi
       - name: Test the package
         timeout-minutes: 15
         # A copy gets Mesa, because the server has no GPU; the download itself never does.
         run: |
           cp -r "dist/Redbarn Studio" pkgtest
-          cp /ucrt64/bin/opengl32.dll /ucrt64/bin/libgallium_wgl.dll pkgtest/
+          cp /ucrt64/bin/opengl32.dll /ucrt64/bin/libgallium_wgl.dll /ucrt64/bin/libLLVM*.dll pkgtest/
           export GALLIUM_DRIVER=llvmpipe
           ./pkgtest/"Redbarn Studio.exe" --self-test | tee selftest.txt
           grep -q "self-test passed" selftest.txt || { echo "packaged self-test failed"; exit 1; }

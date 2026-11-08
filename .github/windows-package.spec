@@ -11,7 +11,9 @@ a = Analysis(
     hooksconfig={"gi": {"module-versions": {"Gtk": "4.0", "Gdk": "4.0"}, "icons": ["Adwaita"], "themes": ["Adwaita"]}},
 )
 # Mesa's software OpenGL is only for the GPU-less build server: shipped, it would override users' graphics drivers.
-a.binaries = [b for b in a.binaries if os.path.basename(b[0]).lower() not in ("opengl32.dll", "libgallium_wgl.dll")]
+# LLVM (150MB) is its compiler, needed by nothing else.
+a.binaries = [b for b in a.binaries if os.path.basename(b[0]).lower() not in ("opengl32.dll", "libgallium_wgl.dll")
+              and not os.path.basename(b[0]).lower().startswith("libllvm")]
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="Redbarn Studio", console=False,
           icon=os.path.join(root, "redbarn-studio.ico"))
