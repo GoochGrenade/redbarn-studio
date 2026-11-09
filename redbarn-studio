@@ -44,7 +44,7 @@ elif WINDOWS and sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the console's default code page can't print ✓
 APP_ID = "co.redbarn.Studio"
 APP_NAME = "Redbarn Studio"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 REPO_URL = "https://github.com/GoochGrenade/redbarn-studio"
 COPYRIGHT = "© 2026 Redbarn Christian Co."
 MIC_NAME = "CABLE Output" if WINDOWS else "Redbarn Mic"  # what to pick in Discord
@@ -593,15 +593,18 @@ vec3 noir(vec2 uv) {
   float g = smoothstep(0.1, 0.85, luma(get(uv))) + grain(uv, 0.1);
   return vec3(g) * vignette(uv, 0.7);
 }
+// A wide-angle security lens. Barrel distortion (Brown-Conrady): lines bend more the further out they are while the
+// middle stays true, and the corners land exactly on the corners, so the frame stays full with no black border.
 vec3 cctv(vec2 uv) {
   vec2 d = uv - 0.5;
-  vec2 a = d * vec2(1.78, 1.0);
-  vec2 src = 0.5 + d * (1.0 + 0.18 * dot(a, a)) * 0.9;  // wide-angle security lens: barrel distortion
-  if (src.x < 0.0 || src.x > 1.0 || src.y < 0.0 || src.y > 1.0) return vec3(0.0);
-  vec3 c = get(src) + bloom(src, 6.0, 0.7) * 0.6;
+  float r2 = dot(d * vec2(1.78, 1.0), d * vec2(1.78, 1.0)) / 1.042;  // 1 at the corners, in true 16:9 proportions
+  vec2 src = 0.5 + d * (1.0 + 0.10 * r2 + 0.02 * r2 * r2) / 1.12;
+  // Red and blue land a touch apart toward the edges (lateral chromatic aberration), as with real wide lenses.
+  vec3 c = vec3(get(0.5 + (src - 0.5) * 1.002).r, get(src).g, get(0.5 + (src - 0.5) * 0.998).b) + bloom(src, 6.0, 0.7) * 0.6;
   c = mix(vec3(luma(c)), c, 0.15) * vec3(0.92, 1.0, 0.96);
   c = (c - 0.5) * 1.2 + 0.5 + grain(uv, 0.12);
-  return c * scanlines(uv, 288.0, 0.14) * vignette(uv, 0.9);
+  float falloff = 1.0 / ((1.0 + 0.1764 * r2) * (1.0 + 0.1764 * r2));  // natural cos^4 vignetting: corners about 72%
+  return c * scanlines(uv, 288.0, 0.14) * falloff;
 }
 vec3 camcorder(vec2 uv) {
   vec2 o = PX * 1.2;
@@ -2672,7 +2675,7 @@ def colour_bars(look):
 
 def check_look_details():
     frames = {}
-    for name in ("Warband", "Old Quest", "VHS", "Thermal"):
+    for name in ("Warband", "Old Quest", "VHS", "Thermal", "CCTV"):
         pipeline, sink = colour_bars(name)
         pipeline.set_state(Gst.State.PLAYING)
         time.sleep(0.4)
@@ -2710,6 +2713,16 @@ def check_look_details():
     smear = tape[(360 * 1280 + 372) * 4]
     print(f"VHS: red smeared {smear} into the cyan bar after yellow")
     assert smear > 30, "VHS colour doesn't trail to the right"
+    lens = frames["CCTV"][0]
+
+    def edge(top):  # where the red bar meets the blue one (x 1097 undistorted), averaged over 10 rows against the grain
+        profile = [sum(sum(lens[(y * 1280 + x) * 4:(y * 1280 + x) * 4 + 3]) for y in range(top, top + 10)) for x in range(950, 1250)]
+        return 950 + max(range(len(profile) - 6), key=lambda i: abs(profile[i + 6] - profile[i])) + 3
+    corner, side = mean(pixels(lens, 2, 30, 2, 30)), mean(pixels(lens, 2, 30, 345, 375))
+    print(f"CCTV: corner {corner:.0f} vs edge middle {side:.0f}; bar edge at the top x={edge(5)}, middle x={edge(355)} (1097 undistorted)")
+    assert corner > 0.4 * side, "CCTV has black or heavy corners"
+    assert edge(5) < edge(355) - 2, "CCTV lines don't curve like a wide-angle lens"
+    assert abs(edge(355) - 1097) < 0.1 * (1097 - 640), "CCTV enlarges the middle of the picture"
     heat = frames["Thermal"][0]
     top, bottom = heat[(165 * 1280 + 1230) * 4:(165 * 1280 + 1230) * 4 + 3], heat[(555 * 1280 + 1230) * 4:(555 * 1280 + 1230) * 4 + 3]
     print(f"Thermal scale bar: top {tuple(top)}, bottom {tuple(bottom)}")
